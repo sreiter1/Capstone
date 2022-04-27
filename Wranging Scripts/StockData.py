@@ -2,9 +2,10 @@
 """
 Created on Wed Nov 10 09:54:23 2021
 
-getData.checkForErrors has a bad SQL fuction with the use of 'tickerErrAttr'
-and getData.saveToSQL in the cmd_string with 'table_name' as a function argument
-as the column value to call in the SQL request.  Need better option...
+getData.checkForErrorsUpdateTickerSymbol() has a bad SQL fuction with the use of 
+'tickerErrAttr' and getData.saveToSQL in the cmd_string with 'table_name' as a 
+function argument as the column value to call in the SQL request.  
+Need better option...
 
 @author: sreit
 """
@@ -16,81 +17,134 @@ import requests
 import sqlite3
 import os
 import sys
+import psutil
+import commonUtilities
 
 
 
-class getData:
-    def __init__(self, API_KEY = "NYLUQRD89OVSIL3I", rate = 5, limit = 500, dataBaseSaveFile = "SQLiteDB/stockData.db"):
-        self.DB = database(dataBaseSaveFile)
-        self.rate = rate   # calls per minute
-        self.limit = limit  # calls per day
-        self.apiTotalCalls = 0  # number of calls already made
-        self.API_KEY = API_KEY  # Key for use with alphaVantage API
-        self.alphaVantageBaseURL = "https://www.alphavantage.co/query?"
-        self.tickerList = []    # Empty list of stock tickers
-        self.apiCallTime = time.time() - 60/self.rate
-        self.workingFileText = ""
-        
+
+class callLimitExceeded(Exception):
+    # raised when the program detects that the call limit was exceeded, 
+    # either because the limit set in 'getData' is exceeded or if the API 
+    # returns a specific error.
+    pass
+
+class vpnResetFailed(Exception):
+    # Occurs if the VPN reset function fails.  This is likely to be triggered
+    # after the API call limit is exceeded if the VPN cannot be reset.
+    pass
 
 
-    def loadStockListCSV(self, stockListFileName, saveToSQL = True):
-        try:
-            # Open the csv-based list of tickers/companies
-            stockFile = open(stockListFileName, "r") 
-            
-        except:
-            print("Bad stock list file.  Unable to open.")
-            return 1
+
+
+
+class getAlphaVantageData:
+    def __init__(self, API_KEY = "NYLUQRD89OVSIL3I", rate = 5, limit = 500, dataBaseSaveFile = "./SQLiteDB/stockData.db"):
+        self.workingFileText = "" # string for printing data to the command line between function calls
+        self.DB = database(dataBaseSaveFile) # SQL object
+        self._cur = self.DB.stockDB.cursor() # Cursor for SQL transactions
+        self._rate = rate   # calls per minute
+        self._limit = limit  # calls per day
+        self._apiTotalCalls = 0  # number of calls already made
+        self._API_KEY = API_KEY  # Key for use with alphaVantage API
+        self._alphaVantageBaseURL = "https://www.alphavantage.co/query?" # base URL for alphavantage
+        apiCallTime = time.time() - 60 # one minute in the past; ensures that there is no delay prior to the first API calls
         
-        Lines = stockFile.readlines()
+        # array of last several API calls within last minute; keeps track of when 
+        # the API calls were made so that the per minute API rate limits are not exceeded
+        self._apiRecentCallTimes = [apiCallTime for i in range(self._rate)] 
         
-        DF_ticker = []
-        DF_name = []
-        DF_exchange = []
-        DF_recordDate = []
+        # Dictionaries that converts a user-input value to the table/columns that 
+        # should be accessed within the SQL database.  Helps to keep the 
+        # database from being corrupted by user inputs.  First dict cooresponds
+        # to the tables that align with the function calls.  The second is 
+        # used to modify the values from the first dict to match the columns in 
+        # the table 'ticker_symbol_list' (that holds a status board of sorts)
+        self._tableConversion = commonUtilities.conversionTables.tickerConversionTable
+        self._tickerListConversion = {"MOSTRECENT"  :  "date_",
+                                      "ERRORCODE"   :  "error_",
+                                      "NUMRECORDS"  :  "records_"}
         
-        for line in Lines:
-            stock = line.split(",")
-            DF_ticker.append(stock[0])
-            DF_name.append(stock[1])
-            DF_exchange.append(stock[2].strip('\n'))
-            DF_recordDate.append(datetime.date.today())
-            
-            
-        df = pd.DataFrame([DF_ticker,
-                           DF_name,
-                           DF_exchange,
-                           DF_recordDate])
-        
-        df.index = ["ticker_symbol", "name", "exchange", "recordDate"]
-        df = df.transpose()
-        
-        if saveToSQL:
-            self.saveToSQL(df, "ticker_symbol_list")
-        
-        return df
+        self.validate = commonUtilities.validationFunctions()
+        self.tools = processTools
     
     
     
-    def checkApiCalls(self):
-        self.apiTotalCalls += 1
+    def _resetTotalApiCalls(self):
+        # function call to reset the API calls so that this quantity is not set directly
+        self._apiTotalCalls = 0
+        return 0
+    
+    
         
-        if self.apiTotalCalls > self.limit:
-            raise SystemExit("Daily API call limit met.  Please wait or increase limit.")
+    def changeAPIKey(self, newKey):
+        # takes a User input API key and assigns it to the API key variable
+        self.validate.validateString(newKey)
         
+        self._API_KEY = "".join(e for e in newKey if e.isalnum())
         
-        while time.time() < self.apiCallTime + 60/self.rate:
-            timeRemaining = int(self.apiCallTime + 60/self.rate - time.time())
-            if(60/self.rate > 10):
-                print("\rDelay for API call rate.  Time remaining = " + str(timeRemaining) + "            ", end = "\r")
+        print("New API key is:  '" + self._API_KEY + "'\n\n")
+        return 0
+    
+    
+    
+    def changeLimit(self, newLimit):
+        # Changes the number of daily calls to a user-assigned value
+        self.validate.validateInteger(newLimit)
+        
+        self._limit = newLimit
+        return 0
+    
+    
+    
+    def changeRate(self, newRate):
+        # Changes the number of calls per minute to a user-assigned value
+        self.validate.validateInteger(newRate)
+            
+        if(self._rate == newRate):
+            return 0
+        
+        # Adjusts the list of call times to match the new rate.
+        while len(self._apiRecentCallTimes) > newRate:
+            self._apiRecentCallTimes.pop(-1)
+        
+        callMaxTime = max(self._apiRecentCallTimes)
+        while len(self._apiRecentCallTimes) < newRate:
+            self._apiRecentCallTimes.append(callMaxTime)
+        
+        self._rate = newRate
+        
+        return 0
+    
+    
+    
+    def _checkApiCalls(self):
+        # function checks the per minute and daily call limits, raising an exception 
+        # if the daily limit is exceeded or delaying execution cycles to match the 
+        # per minute limits.
+        self._apiTotalCalls += 1
+        
+        if self._apiTotalCalls > self._limit:
+            raise callLimitExceeded("Daily API call limit met.  Please wait or increase limit.")
+        
+        # Pause execution for the per-minute limit
+        while time.time() - self._apiRecentCallTimes[0] < 60:
+            timeRemaining = int(self._apiRecentCallTimes[0] + 60 - time.time())
+            print("\rDelay for API call rate.  Time remaining = " + str(timeRemaining) + "            ", end = "\r")
             time.sleep(1)
         
-        print("\rNumber of API calls today = " + str(self.apiTotalCalls) + "               ")
-        self.apiCallTime = time.time()
+        # remove the first (oldest) element from the list and add the current time
+        # to the end of the API call list.  
+        self._apiRecentCallTimes.pop(0)
+        self._apiRecentCallTimes.append(time.time())
+        
+        print("\rNumber of API calls today = " + str(self._apiTotalCalls).rjust(5) + ".  " + str(self._apiTotalCount - self._apiTotalCalls).rjust(6) + "  calls remaining.           ")
         
     
     
-    def checkForErrors(self, ticker_symbol, jsonResponse, funcName = "", tickerErrAttr = ""):
+    def _checkForErrorsUpdateTickerSymbol(self, ticker_symbol, jsonResponse, funcName = ""):
+        # look for errors in the JSON response from the API request
+        # get the keys from the JSON response
         jsonKeys = list(jsonResponse.keys())
         
         if jsonKeys == []:
@@ -99,71 +153,210 @@ class getData:
         else:
             msgType = jsonKeys[0]
             message = jsonResponse[msgType]
-            
-        if "standard API call frequency is 5 calls per minute and 500 calls per day" in message:
-            print("API calls exhausted or too frequent.")
-            raise ValueError("API calls exhausted for today, or calls are too frequent.")
         
+        # check to see if the API responds that the rate or limit were exceeded,
+        # and raises an error.
+        if "standard API call frequency is 5 calls per minute and 500 calls per day" in message:
+            raise callLimitExceeded("API calls exhausted for today, or calls are too frequent.")
+        
+        # checks to see if there is a different issue (i.e. invalid call)
         if msgType in ["Error Message", "Note", "Information", "Empty"]:
-            sqlString  = "INSERT INTO errors_tracker \n"
-            sqlString += "('ticker_symbol', 'recordTime', 'recordDate', " + \
-                         "'errorType', 'errorSource', 'errorMessage')\n"
-            sqlString += "VALUES(?, ?, ?, ?, ?, ?);\n"
             
-            argList = (ticker_symbol, str(time.time()), str(datetime.date.today()), msgType, funcName, message)
-                       
-            cur = self.DB.stockDB.cursor()
-            cur.execute(sqlString, argList)
+            # add a line to the 'api_transactions' table indicating the specific error
+            self._updateAPIStatus(ticker_symbol = ticker_symbol,
+                                  callTime = str(time.time()),
+                                  msgType = msgType,
+                                  source = funcName, 
+                                  message = message, 
+                                  status = "Fail")
             
-            if tickerErrAttr != "":
-                sqlString  = "UPDATE ticker_symbol_list \n"
-                sqlString += "SET '" + tickerErrAttr + "' = 1, \n"
-                sqlString += "    'data_" + tickerErrAttr[6:] + "' = 'Err' \n"
-                sqlString += "WHERE ticker_symbol = ? ; \n"
+            # modify the 'ticker_symbol_list' table to indicate the error status
+            if funcName != "":
+                self._updateTickerList(ticker_symbol = ticker_symbol,  
+                                       recordDate = str(datetime.date.today()),
+                                       columnType = "ERRORCODE", 
+                                       columnFunction = funcName,
+                                       value = "1")
                 
-                argList = (ticker_symbol,)
-                cur.execute(sqlString, argList)
+                self._updateTickerList(ticker_symbol = ticker_symbol,  
+                                       recordDate = str(datetime.date.today()),
+                                       columnType = "MOSTRECENT", 
+                                       columnFunction = funcName,
+                                       value = str(datetime.date.today()))
             
+            # commit the changes
             self.DB.stockDB.commit()
             
-            print("Error on ticker '" + ticker_symbol + "' and function '" + funcName + "':  " + message)
+            print("\r  Error on ticker '" + ticker_symbol + "' and function '" + funcName + "':  " + message)
             
+            # return 1 if there was an error detected
             return 1
-        else:
-            if tickerErrAttr != "":
-                cur = self.DB.stockDB.cursor()
-                cmd_string = "UPDATE ticker_symbol_list \n" + \
-                             "SET '" + tickerErrAttr + "' = 0, \n" + \
-                             "    'data_" + tickerErrAttr[6:] + "' = ? \n" + \
-                             "WHERE ticker_symbol = ? ;\n"
-                
-                argList = (str(datetime.date.today()), ticker_symbol)
-                
-                cur.execute(cmd_string, argList)
-                self.DB.stockDB.commit()
         
+        # return 0 if there was no error
         return 0
     
     
     
-    def getTimeSeriesDaily(self, ticker_symbol, save = True):
+    def _updateAPIStatus (self, 
+                          ticker_symbol, 
+                          callTime = str(time.time()), #  <-- might not actually call this function on default conditions.  Add time.time() to the function call to ensure it works
+                          callDate = str(datetime.date.today()), 
+                          msgType = None, 
+                          source = None, 
+                          message = None, 
+                          status = None):
+        
+        # function that runs an update for the 'api_transactions' table.  
+        # ticker_symbol should be a string of letters and potentially hyphens
+        # callTime is the UTC time of the API call as a string; measured in seconds since 1 Jan 1970
+        # callDate is a string representing the date of the call (YYYY-MM-DD format)
+        # msgType is type of error (error, information, empty, etc) or "Success" if the call was successful
+        # source is a string representing the function that generated the API call.  Translated through self._tableConversion()
+        # message is the string containing the error details
+        # status contains "Success" or "Fail" for whether the call passed or not
+        
+        # check inputs for problematic data
+        self.validate.validateString(ticker_symbol)
+        self.validate.validateString(callTime)
+        self.validate.validateDateString(callDate)
+        if source not in self._tableConversion.keys():
+            raise ValueError("Source not in conversion table.")
+            
+        
+        # insert a new record with the ticker and call time to the 'api_transactions' table
+        ticker_symbol = "".join(e.upper() for e in ticker_symbol if (e.isalpha() or e == "-"))
+        sqlString  = "INSERT OR IGNORE INTO api_transactions (ticker_symbol, call_time) \n"
+        sqlString += "VALUES(?, ?)"
+        argList = (ticker_symbol, callTime)
+        self._cur.execute(sqlString, argList)
+        
+        
+        # Create a query string and list of arguments to update the record made above
+        # based on the other values passed to the function.  Each input is scrubbed 
+        # for non-applicable characters.
+        argList = []
+        sqlString  = "UPDATE api_transactions \n SET "
+        if isinstance(callDate, str):
+            callDate = "".join(e for e in callDate if (e.isalnum() or e == "-"))
+            argList.append(callDate)
+            sqlString += " call_date = ?,\n   "
+        if isinstance(msgType, str):
+            msgType = "".join(e for e in msgType if (e.isalnum() or e in ["-", " "]))
+            argList.append(msgType)
+            sqlString += " type = ?,\n   "
+        if isinstance(source, str):
+            source = "".join(e for e in source if (e.isalnum() or e == "_"))
+            argList.append(self._tableConversion[source].replace("_", " ").title())
+            sqlString += " source = ?,\n   "
+        if isinstance(message, str):
+            message = "".join(e for e in message if (e.isalnum() or e in ["-", "_", ",", ".", " ", "/", "(", ")"]))
+            argList.append(message)
+            sqlString += " message = ?,\n   "
+        if isinstance(status, str):
+            status = "".join(e for e in status if e.isalpha())
+            argList.append(status)
+            sqlString += " status = ?,\n   "
+        
+        # finish the string, execute the SQL transaction, and commit the changes
+        sqlString  = sqlString[:-5] + "\n"
+        sqlString += "WHERE ticker_symbol = ? AND call_time = ?; \n"
+        argList.append(ticker_symbol)
+        argList.append(callTime)
+        argList = tuple(argList)
+        self._cur.execute(sqlString, argList)
+        self.DB.stockDB.commit()
+        
+    
+    
+    def _updateTickerList(self, 
+                          ticker_symbol, 
+                          recordDate = str(datetime.date.today()), 
+                          name = None, 
+                          exchange = None, 
+                          columnType = None, 
+                          columnFunction = None, 
+                          value = None):
+        
+        # function that runs an update for the 'ticker_symbol_list' table.  
+        # ticker_symbol should be a string of letters and potentially hyphens
+        # recordDate is a string representing the date of the call (YYYY-MM-DD format)
+        # name is string for the company name
+        # exchange is a string for the exchange the stock is traded on
+        # columnType is a string key for self._tickerListConversion (values are 'date_', 'error_', and 'records_')
+        # columnFunction is a string key for self._tableConversion (values are the tables/functions)
+        # value is a string for the data that should be saved into the table
+        
+        # check inputs for problematic data
+        self.validate.validateString(ticker_symbol)
+        self.validate.validateDateString(recordDate)
+        if name == None and exchange == None and value == None:
+            raise ValueError("Name, Exchange,  *AND*  Value in 'updateTickerList()' are empty; nothing to update.  ")
+        
+        ticker_symbol = "".join(e.upper() for e in ticker_symbol if (e.isalpha() or e == "-"))
+        columnType = "".join(e for e in columnType if e.isalpha())
+        columnFunction = "".join(e for e in columnFunction if e.isalpha())
+        
+        columnType = self._tickerListConversion[columnType]
+        columnFunction = self._tableConversion[columnFunction]
+        columnName = columnType + columnFunction
+        
+        
+        # Create a query string and list of arguments to update the record made above
+        # based on the other values passed to the function.  Each input is scrubbed 
+        # for non-applicable characters.
+        argList = []
+        
+        sqlString  = "UPDATE ticker_symbol_list \n"
+        sqlString += "SET "
+        if isinstance(recordDate, str):
+            recordDate = "".join(e.upper() for e in recordDate if (e.isalnum()) or e == "-")
+            argList.append(recordDate)
+            sqlString += " recordDate = ?,\n    "
+        if isinstance(name, str):
+            name = "".join(e for e in name if e.isalpha())
+            argList.append(name)
+            sqlString += " name = ?,\n    "
+        if isinstance(exchange, str):
+            exchange = "".join(e for e in exchange if e.isalpha())
+            argList.append(exchange)
+            sqlString += " exchange = ?,\n    "
+        if isinstance(value, str):
+            value = "".join(e.upper() for e in value if (e.isalnum() or e in ["-", "_", ",", ".", " "]))
+            argList.append(value)
+            sqlString += " " + columnName + " = ?,\n    "
+        
+        # finish the string, execute the SQL transaction, and commit the changes
+        sqlString  = sqlString[:-6] + "\n"
+        sqlString += "WHERE ticker_symbol = ?; \n"
+        argList.append(ticker_symbol)
+        argList = tuple(argList)
+        
+        self._cur.execute(sqlString, argList)
+        self.DB.stockDB.commit()
+    
+    
+    
+    def _getTimeSeriesDaily(self, ticker_symbol, save = True):
         # Collects the time Series data for a selected ticker
                     
         # Build the request URL for alphaVantage API
-        requestURL = self.alphaVantageBaseURL + "function=TIME_SERIES_DAILY_ADJUSTED&" + \
-                     "outputsize=full&symbol=" + ticker_symbol + "&apikey=" + self.API_KEY
+        requestURL = self._alphaVantageBaseURL + "function=TIME_SERIES_DAILY_ADJUSTED&" + \
+                     "outputsize=full&symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
-        # Send API request
-        self.checkApiCalls()
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.
+        self._checkApiCalls()
         
+        # Send API request and extract the JSON data
         response = requests.get(requestURL)
         data = response.json()
         
         # Check the response for errors
-        if self.checkForErrors(ticker_symbol, data, "Time Series Daily", "error_daily_adjusted"):
-            return None 
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "time"):
+            return None
         
-        # Extract the data from the response and convert it to a pandas dataframe
+        # Extract the data from the response and convert it to a dataframe
         stockDF = pd.DataFrame(data["Time Series (Daily)"])
         stockDF = stockDF.transpose()
         
@@ -179,40 +372,36 @@ class getData:
         stockDF['ticker_symbol'] = ticker_symbol
         stockDF['recordDate'] = stockDF.index
         
+        # optionally save the data to the SQLite database
         if save:
-            self.saveToSQL(stockDF, "daily_adjusted", ticker_symbol)
-            
-            cmd_string = "UPDATE ticker_symbol_list \n" + \
-                         "SET 'hist_length' = ? \n" + \
-                         "WHERE ticker_symbol = ?;\n"
-            
-            argList = (len(stockDF.index), ticker_symbol)
-            
-            cur.execute(cmd_string, argList)
-            self.DB.stockDB.commit()
-                
+            self.saveToSQL(stockDF, "time", ticker_symbol)
+        
+        # return the downloaded data back from the function
         return stockDF
     
     
 
-    def getFundamentalOverview(self, ticker_symbol, save = True):
-        # Collects the time Series data for a selected ticker
+    def _getFundamentalOverview(self, ticker_symbol, save = True):
+        # Collects the company overview/fundamental data for a selected ticker
                     
         # Build the request URL for alphaVantage API
-        requestURL = self.alphaVantageBaseURL + "function=OVERVIEW&" + \
-                     "symbol=" + ticker_symbol + "&apikey=" + self.API_KEY
+        requestURL = self._alphaVantageBaseURL + "function=OVERVIEW&" + \
+                     "symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
-        # Send API request
-        self.checkApiCalls()
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.
+        self._checkApiCalls()
         
+        # Send API request and extract the JSON data
         response = requests.get(requestURL)
         data = response.json()
         
         # Check the response for errors
-        if self.checkForErrors(ticker_symbol, data, "Fundamental Overview", "error_fund_overview"):
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "overview"):
             return None 
         
-        # Extract the data from the response and convert it to a 
+        # Extract the data from the response and convert it to a dataframe
         stockDF = pd.DataFrame(list(data.items()), index = data.keys(), columns = ["Label","Data"])
         
         stockDF.rename(index={"Symbol":"ticker_symbol", \
@@ -220,41 +409,49 @@ class getData:
                               "52WeekLow":"low_52week", \
                               "50DayMovingAverage":"moving_average_50d", \
                               "200DayMovingAverage":"moving_average_200d"}, inplace=True)
-        
+            
+        # transpose the dataframe and add a marker for the date the data was saved
         stockDF = stockDF.transpose()
         stockDF.drop('Label', inplace = True)
         
         stockDF['recordDate'] = str(datetime.date.today())
         
+        # optionally save the data to the SQLite database
         if save:
-            self.saveToSQL(stockDF, "fund_overview", ticker_symbol)
-            
+            self.saveToSQL(stockDF, "overview", ticker_symbol)
+        
+        # return the downloaded data back from the function
         return stockDF
     
 
 
-    def getCashFlow(self, ticker_symbol, save = True):
-        # Collects the time Series data for a selected ticker
+    def _getCashFlow(self, ticker_symbol, save = True):
+        # Collects the cash flow data for a selected ticker
                     
         # Build the request URL for alphaVantage API
-        requestURL = self.alphaVantageBaseURL + "function=CASH_FLOW&" + \
-                     "symbol=" + ticker_symbol + "&apikey=" + self.API_KEY
+        requestURL = self._alphaVantageBaseURL + "function=CASH_FLOW&" + \
+                     "symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
-        # Send API request
-        self.checkApiCalls()
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.
+        self._checkApiCalls()
         
+        # Send API request and extract the JSON data
         response = requests.get(requestURL)
         data = response.json()
         
         # Check the response for errors
-        if self.checkForErrors(ticker_symbol, data, "Cash Flow", "error_cash_flow"):
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "cash"):
             return None 
         
-        # Extract the data from the response and convert it to a dataframe
+        # separate the annual and quarterly data from the JSON and convert it 
+        # to a dataframe
         annual = pd.DataFrame(data['annualReports'])
         quarterly = pd.DataFrame(data['quarterlyReports'])
         
-        # Add boolean column for annual vs quarterly and for the ticker symbol
+        # Add boolean column for annual vs quarterly, and a column for the 
+        # ticker symbol
         annual['annualReport'] = 1
         quarterly['annualReport'] = 0
         annual['ticker_symbol'] = ticker_symbol
@@ -268,35 +465,42 @@ class getData:
                         "proceedsFromIssuanceOfLongTermDebt", \
                         "fiscalDateEnding":"recordDate"}, axis=1, inplace=True)
         
+        # optionally save the data to the SQLite database
         if save:
-            self.saveToSQL(stockDF, "cash_flow", ticker_symbol)
+            self.saveToSQL(stockDF, "cash", ticker_symbol)
             
+        # return the downloaded data back from the function
         return stockDF
     
     
     
-    def getIncomeStatement(self, ticker_symbol, save = True):
-        # Collects the time Series data for a selected ticker
+    def _getIncomeStatement(self, ticker_symbol, save = True):
+        # Collects the income statement data for a selected ticker
                     
         # Build the request URL for alphaVantage API
-        requestURL = self.alphaVantageBaseURL + "function=INCOME_STATEMENT&" + \
-                     "symbol=" + ticker_symbol + "&apikey=" + self.API_KEY
+        requestURL = self._alphaVantageBaseURL + "function=INCOME_STATEMENT&" + \
+                     "symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
-        # Send API request
-        self.checkApiCalls()
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded. 
+        self._checkApiCalls()
         
+        # Send API request and extract the JSON data
         response = requests.get(requestURL)
         data = response.json()
         
         # Check the response for errors
-        if self.checkForErrors(ticker_symbol, data, "Income Statement", "error_income_statement"):
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "income"):
             return None 
         
-        # Extract the data from the response and convert it to a dataframe
+        # separate the annual and quarterly data from the JSON and convert it 
+        # to a dataframe
         annual = pd.DataFrame(data['annualReports'])
         quarterly = pd.DataFrame(data['quarterlyReports'])
         
-        # Add boolean column for annual vs quarterly and for the ticker symbol
+        # Add boolean column for annual vs quarterly, and a column for the 
+        # ticker symbol
         annual['annualReport'] = 1
         quarterly['annualReport'] = 0
         annual['ticker_symbol'] = ticker_symbol
@@ -308,67 +512,80 @@ class getData:
         
         stockDF.rename({"fiscalDateEnding":"recordDate"}, axis=1, inplace=True)
         
+        # optionally save the data to the SQLite database
         if save:
-            self.saveToSQL(stockDF, "income_statement", ticker_symbol)
-            
+            self.saveToSQL(stockDF, "income", ticker_symbol)
+
+        # return the downloaded data back from the function
         return stockDF
 
 
 
-    def getEarnings(self, ticker_symbol, save = True):
-        # Collects the time Series data for a selected ticker
+    def _getEarnings(self, ticker_symbol, save = True):
+        # Collects the earnings data for a selected ticker
                     
         # Build the request URL for alphaVantage API
-        requestURL = self.alphaVantageBaseURL + "function=EARNINGS&" + \
-                     "symbol=" + ticker_symbol + "&apikey=" + self.API_KEY
+        requestURL = self._alphaVantageBaseURL + "function=EARNINGS&" + \
+                     "symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
-        # Send API request
-        self.checkApiCalls()
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.  
+        self._checkApiCalls()
         
+        # Send API request and extract the JSON data
         response = requests.get(requestURL)
         data = response.json()
         
         # Check the response for errors
-        if self.checkForErrors(ticker_symbol, data, "Earnings", "error_earnings"):
-            return None 
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "earnings"):
+            return None
         
-        # Extract the data from the response and convert it to a dataframe
+        # separate the annual and quarterly data from the JSON and convert it 
+        # to a dataframe
         stockDF = pd.DataFrame(data['quarterlyEarnings'])
         
-        # Add boolean column for annual vs quarterly and for the ticker symbol
+        # Add a column for the ticker symbol
         stockDF['ticker_symbol'] = ticker_symbol
         
         stockDF.rename({"fiscalDateEnding":"recordDate"}, axis=1, inplace=True)
         
+        # optionally save the data to the SQLite database
         if save:
             self.saveToSQL(stockDF, "earnings", ticker_symbol)
-            
+
+        # return the downloaded data back from the function
         return stockDF
 
 
 
-    def getBalanceSheet(self, ticker_symbol, save = True):
-        # Collects the time Series data for a selected ticker
+    def _getBalanceSheet(self, ticker_symbol, save = True):
+        # Collects the balance sheet data for a selected ticker
                     
         # Build the request URL for alphaVantage API
-        requestURL = self.alphaVantageBaseURL + "function=BALANCE_SHEET&" + \
-                     "symbol=" + ticker_symbol + "&apikey=" + self.API_KEY
+        requestURL = self._alphaVantageBaseURL + "function=BALANCE_SHEET&" + \
+                     "symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
-        # Send API request
-        self.checkApiCalls()
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.  
+        self._checkApiCalls()
         
+        # Send API request and extract the JSON data
         response = requests.get(requestURL)
         data = response.json()
         
         # Check the response for errors
-        if self.checkForErrors(ticker_symbol, data, "Balance Sheet", "error_balance_sheet"):
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "balance"):
             return None 
         
-        # Extract the data from the response and convert it to a dataframe
+        # separate the annual and quarterly data from the JSON and convert it 
+        # to a dataframe
         annual = pd.DataFrame(data['annualReports'])
         quarterly = pd.DataFrame(data['quarterlyReports'])
         
-        # Add boolean column for annual vs quarterly and for the ticker symbol
+        # Add boolean column for annual vs quarterly, and a column for the 
+        # ticker symbol
         annual['annualReport'] = 1
         quarterly['annualReport'] = 0
         annual['ticker_symbol'] = ticker_symbol
@@ -380,52 +597,130 @@ class getData:
         
         stockDF.rename({"fiscalDateEnding":"recordDate"}, axis=1, inplace=True)
         
+        # optionally save the data to the SQLite database
         if save:
-            self.saveToSQL(stockDF, "balance_sheet", ticker_symbol)
-            
+            self.saveToSQL(stockDF, "balance", ticker_symbol)
+        
+        # return the downloaded data back from the function
         return stockDF
     
 
 
-    def saveToSQL(self, stockDF, table_name, ticker_symbol = ""):
+    def saveToSQL(self, stockDF, table, ticker_symbol = ""):
         # Saves a dataframe to the SQLite database.  Functions as a wrapper for
         # this class and its dataframes.  The dataframes and SQLite schema were
         # setup to match and work well together.
         
-        # cursor for the database
-        cur = self.DB.stockDB.cursor()
+        print(ticker_symbol + "     " + self._tableConversion[table].replace("_", " ").title() + "       ", end = "")
         
-        print(ticker_symbol + " ", end = "")
+        # Check to see if the dataframe passed is actually empty, execute an
+        # api_transaction for the empty dataframe, and move on to the next call.
+        if stockDF.empty:
+            self._emptyDF(stockDF, table, ticker_symbol)
+            return 1
         
-        # Command string that identifies which table to insert data into.
-        # "table_name" is passed into this function, which makes this function
-        # less than ideally secure.  Column_string accumulates the columns from
-        # the dataframe in a way that the SQLite database can identify.  
-        # value_string accumulates '?' to include the values that each column 
-        # contains.
-        
-        cmd_string = "INSERT INTO " + table_name + " \n"
-        column_string = "('"
-        value_string = "VALUES("
-        
-        for key in stockDF.keys():
-            column_string += key + "', '"
-            value_string  += "?, "
-        
-        # Close out the strings for the SQL transaction
-        column_string = column_string[:-3] + ")\n"
-        value_string  = value_string[:-2]  + ");\n"
-        cmd_string += column_string + value_string
-        
-        
-        # Convert the pandas dataframe into a list of tuples for addition to
-        # the SQLite database, and commit the changes.
-        data_list = list(stockDF.to_records(index=False))
-        print("\r" + self.workingFileText + ticker_symbol.rjust(6) + " records written: " + str(len(data_list)).rjust(7), end = "")
-        cur.executemany(cmd_string, data_list)
+        # Create an entry for in the respective table for the API call that was made 
+        if table in ["balance", "cash"]:
+            insert_string  = "INSERT OR IGNORE INTO " + self._tableConversion[table]
+            insert_string += " (ticker_symbol, recordDate, annualReport) "
+            insert_string += "VALUES(?, ?, ?) \n"
+            insert_list = stockDF[["ticker_symbol","recordDate","annualReport"]].values.tolist()
+        else:
+            insert_string  = "INSERT OR IGNORE INTO " + self._tableConversion[table]
+            insert_string += " (ticker_symbol, recordDate) "
+            insert_string += "VALUES(?, ?) \n"
+            insert_list = stockDF[["ticker_symbol","recordDate"]].values.tolist()
+                
+        self._cur.executemany(insert_string, insert_list)
         self.DB.stockDB.commit()
         
+        
+        # Update the record created above with the other data passed to the function.
+        update_string = "UPDATE " + self._tableConversion[table] + " SET \n"
+        argList = pd.DataFrame()
+        
+        for key in stockDF.keys():
+            if key not in ["ticker_symbol", "recordDate", "annualReport"]:
+                update_string += "  " + key + " = ?,\n"
+                argList[key] = stockDF[key]
+        
+        # Add 'where' clause to the SQL transaction to ensure that the correct record is altered.
+        update_string = update_string[:-2] + "\nWHERE "
+        if table in ["balance", "cash"]:
+            # Close out the strings for the SQL transaction
+            update_string += "ticker_symbol = ? \n"
+            update_string += "AND recordDate = ? \n"
+            update_string += "AND annualReport = ?; \n"
+            argList["ticker_symbol"] = stockDF["ticker_symbol"]
+            argList["recordDate"] = stockDF["recordDate"]
+            argList["annualReport"] = stockDF["annualReport"]
+        else:
+            # Close out the strings for the SQL transaction
+            update_string += "ticker_symbol = ? \n"
+            update_string += "AND recordDate = ?; \n"
+            argList["ticker_symbol"] = stockDF["ticker_symbol"]
+            argList["recordDate"] = stockDF["recordDate"]
+            
+        argList = argList.values.tolist()
+        
+        # Execute the transactions and update the 'api_transactions' table with 
+        # a success message, and the 'ticker_symbol_list' table with the 
+        # respective information.
+        self._cur.executemany(update_string, argList)
+        
+        self._updateTickerList(ticker_symbol = ticker_symbol,
+                               columnType = "NUMRECORDS",
+                               columnFunction = table,
+                               value = str(len(stockDF["ticker_symbol"])))
+        self._updateTickerList(ticker_symbol = ticker_symbol,
+                               columnType = "ERRORCODE",
+                               columnFunction = table,
+                               value = "0")
+        self._updateTickerList(ticker_symbol = ticker_symbol,
+                               columnType = "MOSTRECENT",
+                               columnFunction = table,
+                               value = str(datetime.date.today()))
+        
+        self._updateAPIStatus(ticker_symbol = ticker_symbol, 
+                              callTime = str(time.time()),
+                              msgType = "Success",
+                              source = table,
+                              message = "Data saved successfully.",
+                              status = "Success")
+        
+        print("\r" + self.workingFileText + ticker_symbol.rjust(6) + " records written: " + str(len(stockDF["ticker_symbol"])).rjust(7) + "  to table '" + self._tableConversion[table].replace("_", " ").title() + "'", end = "")
+        
         print("\nDone", end = "")
+    
+    
+    
+    def _emptyDF(self, stockDF, table, ticker_symbol):
+        # creates the entries when the API provides a non-empty responcse but 
+        # the dataframe extracted from the response is empty.
+        msgType = "Error"
+        message = "API returned information; extracted DataFrame was empty."
+        
+        self._updateAPIStatus(ticker_symbol = ticker_symbol, 
+                              callTime = str(time.time()),
+                              msgType = msgType,
+                              source = table,
+                              message = message,
+                              status = "Fail")
+        
+        self._updateTickerList(ticker_symbol = ticker_symbol,
+                               columnType = "MOSTRECENT",
+                               columnFunction = table,
+                               value = str(datetime.date.today()))
+        self._updateTickerList(ticker_symbol = ticker_symbol,
+                               columnType = "NUMRECORDS",
+                               columnFunction = table,
+                               value = "0")
+        self._updateTickerList(ticker_symbol = ticker_symbol,
+                               columnType = "ERRORCODE",
+                               columnFunction = table,
+                               value = "1")
+        
+        print("\r  Error on ticker '" + ticker_symbol + "' and function '" + self._tableConversion[table].replace("_", " ").title() + "':  " + message)
     
     
     
@@ -434,8 +729,7 @@ class getData:
         
         # Read the database and see what trackers are already in the database.
         # allows for the insertion of new records if the record doesn't exist
-        cur = self.DB.stockDB.cursor()
-        query = cur.execute("SELECT * FROM ticker_symbol_list")
+        query = self._cur.execute("SELECT * FROM ticker_symbol_list")
         cols = [column[0] for column in query.description]
         DF_tickerList = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
         DF_tickerList = list(DF_tickerList["ticker_symbol"])
@@ -450,25 +744,32 @@ class getData:
             # Parse file names; files are named like this:
             #
             # 2_AAAA_Type_detailedType.pickle
+            # keep the stock ticker ("AAAA") and append it to DF_driList
             
             fileName = file.split(".")[0].split("_")
             DF_dirList.append(fileName[1])
         
-        
+        # Remove all the repeat tickers (potentially from files containing
+        # different data), remove those that are already in the SQLite database,
+        # and then sort alphabetically.  
         DF_dirList = list(dict.fromkeys(DF_dirList))
         DF_dirList = list(set(DF_dirList) - set(DF_tickerList))
         DF_dirList.sort()
         
+        # Convert the list of tickers from the directory to a pandas dataframe,
+        # transpose it, and then add the date that the information was added to
+        # to the SQLite database.
         DF_tickers = pd.DataFrame([DF_dirList])
         DF_tickers = DF_tickers.transpose()
         DF_tickers["recordDate"] = str(datetime.date.today())
         
-        
+        # add column headers and save to the database
         DF_tickers.columns = ["ticker_symbol", "recordDate"]
         self.saveToSQL(DF_tickers, "ticker_symbol_list")
          
         print("Done.")
         
+        # return the list of tickers added for use outside the function
         return DF_tickers
     
     
@@ -479,15 +780,15 @@ class getData:
         # translates the last part of the filename to the SQLite table
         # that the data needs to be entered into.
         
-        conversion = {"TimeData":"daily_adjusted",
-                      "annualBalance":"balance_sheet",
-                      "quarterlyBalance":"balance_sheet",
-                      "annualCash":"cash_flow",
-                      "quarterlyCash":"cash_flow",
-                      "quarterlyEarnings":"earnings",
-                      "Overview":"fund_overview",
-                      "annualIncome":"income_statement",
-                      "quarterlyIncome":"income_statement"}
+        pickleConversion = {"TimeData":"daily_adjusted",
+                            "annualBalance":"balance_sheet",
+                            "quarterlyBalance":"balance_sheet",
+                            "annualCash":"cash_flow",
+                            "quarterlyCash":"cash_flow",
+                            "quarterlyEarnings":"earnings",
+                            "Overview":"fundamental_overview",
+                            "annualIncome":"income_statement",
+                            "quarterlyIncome":"income_statement"}
         
         self.addPickleToTickerList(stocksDirectory)
         
@@ -525,10 +826,6 @@ class getData:
             # Read the pickle file into a pandas dataframe.
             df = pd.read_pickle(stocksDirectory + file)
             
-            # String used later in the SQLite call; see details near the end
-            # of this function.
-            histLengthString = "\n"
-            
             # Series of if statements that determine the which type of data is 
             # in the dataframe, followed by a series of adustments that are used
             # to prepare the dataframe for entry into the SQLite database.
@@ -542,22 +839,21 @@ class getData:
                            "split coefficient": "split"}, axis=1, inplace=True)
                 df['ticker_symbol'] = ticker_symbol
                 df['recordDate'] = df.index.date
-                tickerTrackerEntry = "daily_adjusted"
-                histLengthString = ", \n    'hist_length' = " + str(len(df.index)) + "\n"
+                tableName = "time"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "annualBalance":
                 df['annualReport'] = 1
                 df['ticker_symbol'] = ticker_symbol
                 df["recordDate"] = df.index.date
-                tickerTrackerEntry = "balance_sheet"
+                tableName = "balance"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "quarterlyBalance":
                 df['annualReport'] = 0
                 df['ticker_symbol'] = ticker_symbol
                 df['recordDate'] = df.index.date
-                tickerTrackerEntry = "balance_sheet"
+                tableName = "balance"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "annualCash":
@@ -566,7 +862,7 @@ class getData:
                 df['recordDate'] = df.index.date
                 df.rename({"proceedsFromIssuanceOfLongTermDebtAndCapitalSecuritiesNet":
                            "proceedsFromIssuanceOfLongTermDebt"}, axis=1, inplace=True)
-                tickerTrackerEntry = "cash_flow"
+                tableName = "cash"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "quarterlyCash":
@@ -575,7 +871,7 @@ class getData:
                 df['recordDate'] = df.index.date
                 df.rename({"proceedsFromIssuanceOfLongTermDebtAndCapitalSecuritiesNet":
                            "proceedsFromIssuanceOfLongTermDebt"}, axis=1, inplace=True)
-                tickerTrackerEntry = "cash_flow"
+                tableName = "cash"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "annualEarnings":
@@ -584,7 +880,7 @@ class getData:
             elif typeFile == "quarterlyEarnings":
                 df['ticker_symbol'] = ticker_symbol
                 df['recordDate'] = df.index.date
-                tickerTrackerEntry = "earnings"
+                tableName = "earnings"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "Overview":
@@ -598,36 +894,40 @@ class getData:
                 df = df.transpose()
                 df.drop('Label', inplace = True)
                 df['recordDate'] = df["LatestQuarter"]
-                tickerTrackerEntry = "fund_overview"
+                tableName = "overview"
                 infoDate = df["LatestQuarter"]
                 
             elif typeFile == "annualIncome":
                 df['annualReport'] = 1
                 df['ticker_symbol'] = ticker_symbol
                 df['recordDate'] = df.index.date
-                tickerTrackerEntry = "income_statement"
+                tableName = "income"
                 infoDate = str(df.index.max().date())
                 
             elif typeFile == "quarterlyIncome":
                 df['annualReport'] = 0
                 df['ticker_symbol'] = ticker_symbol
                 df['recordDate'] = df.index.date
-                tickerTrackerEntry = "income_statement"
+                tableName = "income"
                 infoDate = str(df.index.max().date())
             
             
             # Validates that the date associated with the most recent time the
             # data was current is actually formated as a date.
             try:
-                self.validate(infoDate)
+                self.validateDateString(infoDate)
             except:
                 infoDate = "2021-08-06"
             
             # Name of the table that the data needs to be entered into, as
             # determined by the file name and the converstion table above.
-            tableName = conversion[typeFile]
+            tableName = pickleConversion[typeFile]
             
-            # Save the data into teh SQLite database.  Takes several minutes
+            # for column in df:
+            #     pd.to_numeric(df[column], errors = 'ignore')
+            # return df
+            
+            # Save the data into the SQLite database.  Takes several minutes
             # for the series of files I had (~4.6 GB when complete)
             self.saveToSQL(df, tableName, ticker_symbol)
             
@@ -635,142 +935,629 @@ class getData:
             # were any errors downloading the data (no), whether the data in the
             # database is valid (yes), and when the data was last requested from 
             # the AlphaVantage API.  
-            #
-            # The 'histLengthString' variable is set in the "Time Series Daily"
-            # if block above, or consists of a new line if the file is not the
-            # daily time series.  The value set in the string represents the
-            # number of daily records available for a given stock, allowing
-            # a list of stocks with at least that many trading days available 
-            # to be generated quickly.
             
-            cmd_string = "UPDATE ticker_symbol_list \n" + \
-                         "SET 'data_" + tickerTrackerEntry + "' = ?, \n" + \
-                         "    'error_" + tickerTrackerEntry + "' = 0" + \
-                         histLengthString + \
-                         "WHERE ticker_symbol = ?;\n"
-            argList = (infoDate, ticker_symbol)
+            self._updateTickerList(ticker_symbol = ticker_symbol,
+                                   recordDate = infoDate,
+                                   columnType = "ERRORCODE",
+                                   columnFunction = tableName,
+                                   value = "0")
             
-            # Execute the SQLite transaction.
-            cur.execute(cmd_string, argList)
-        
+            self._updateTickerList(ticker_symbol = ticker_symbol,
+                                   recordDate = infoDate,
+                                   columnType = "MOSTRECENT",
+                                   columnFunction = tableName,
+                                   value = infoDate)
+            
+            self._updateTickerList(ticker_symbol = ticker_symbol,
+                                   recordDate = infoDate,
+                                   columnType = "NUMRECORDS",
+                                   columnFunction = tableName,
+                                   value = str(len(df.index)))
         
         self.workingFileText = ""
     
     
     
-    def validate(self, date_text):
-        # Checks the string entered to see if it can be parsed into a date.
-        try:
-            datetime.datetime.strptime(date_text, '%Y-%m-%d')
-        except ValueError:
-            raise ValueError("Incorrect data format, should be YYYY-MM-DD")
-    
-    
-    
-    def loadTickerFromSQL(self, tableName, ticker_symbol = "*", propertyName = "*"):
-        dat = self.DB.stockDB.cursor()
+    def autoUpdate(self, 
+                   metrics = None, 
+                   stockList = None, 
+                   startTicker = None, 
+                   missing = True, 
+                   error = False, 
+                   olderThan = None, 
+                   numRecords = None):
         
-        queryString = "SELECT ? From ?\n"
-        queryString += "WHERE ticker_symbol = ?;"
+        # Automatically run through the database and identify missing, old, or 
+        # erroroneous data for update, then get the data from AlphaVantage.
+        # There are several conditions that are checked and used to build
+        # a SQL query string that is ultimately run in the database.
+                
+        # check inputs to the function to ensure conformity
+        if isinstance(stockList, str):
+            stockList = ["".join(e for e in stockList if e.isalpha())]
+            
+        if isinstance(metrics, str):
+            metrics = ["".join(e for e in metrics if e.isalpha())]
+            
+        if isinstance(startTicker, list):
+            startTicker = startTicker[0]
+            
+        if isinstance(olderThan, str):
+            try:
+                self.validate.validateDateString(olderThan)
+                then = datetime.datetime.strptime(olderThan, '%Y-%m-%d').date()
+                now  = datetime.datetime.now().date()
+                olderThan = (now - then).days
+            except:
+                raise ValueError("'olderThan' not recognized as a date (format: '%Y-%m-%d').")
+                
         
-        argList = (propertyName, tableName, ticker_symbol)
+        if not (isinstance(metrics, list) or metrics == None) or \
+           not (isinstance(stockList, list) or stockList == None) or \
+           not (isinstance(startTicker, str) or startTicker == None) or \
+           not (isinstance(missing, bool)) or \
+           not (isinstance(error, bool)) or \
+           not (isinstance(olderThan, int) or olderThan == None) or \
+           not (isinstance(numRecords, int) or numRecords == None):
+            raise TypeError("At least one input to autoUpdate is not of the correct type./n")
         
-        query = dat.execute(queryString, argList)
-        cols = [column[0] for column in query.description]
-        results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
-        return results
-    
-    
-    def autoUpdate(self, metrics = None, olderThan = None, stockList = None, missing = True, error = False, limit = None):
         
-        # metrics = None
-        # olderThan = None
-        # stockList = None
-        # missing = True
-        # error = False
-        # limit = None
         
-        cur = self.DB.stockDB.cursor()
-        conversion = {"time":"daily_adjusted",
-                      "balance":"balance_sheet",
-                      "cash":"cash_flow",
-                      "earnings":"earnings",
-                      "overview":"fund_overview",
-                      "income":"income_statement"}
         
+        # default metrics to be all of the metrics; otherwise call the specific
+        # functions for the data requested.
         if metrics == None:
             metrics = ["time", "balance", "cash", "earnings", "overview", "income"]
+            
         
-        if olderThan != None:
-            metricListString = "OR data_[METRICS] < " + str(datetime.date.today()-datetime.timedelta(days = olderThan))
-        else:
-            metricListString = ""
+        # Need a starting point for building the SQL query string
+        # metricListString contains the stock filter conditions
+        # queryStringBase contains the base request with parameters that get replaced 
+        # before the SQL request is sent.
+        
+        # "WHERE NOT 1=1 " ensures that there is at least one condition after where
+        # to prevent sytax errors at runtime.
+        metricListString = ""
+        queryStringBase  = "SELECT ticker_symbol " +\
+                           "FROM ticker_symbol_list \n" +\
+                           "WHERE "
         
         
-        columnString = ""
-        metricString = ""
-        queryStringBase  = "SELECT ticker_symbol, hist_length, recordDate" +\
-                           "[METRIC_LIST] FROM ticker_symbol_list \n"
-        queryStringBase += "WHERE NOT 1=1 " 
+        # Start the filtering string.  Start depends on whether the 
+        if error or missing or olderThan != None:
+            metricListString += " ("
+        else: 
+            metricListString += " (1=1 OR "
         
+        
+        # Add conditions that will evaluate to true if the previous request 
+        # resulted in an error.
         if missing:
-            metricListString += " OR data_[METRICS] IS NULL \n"
-            metricListString += " OR error_[METRICS] = -1 \n"
+            metricListString += "date_[METRICS] IS NULL OR "
+            metricListString += "error_[METRICS] = -1 OR "
         if error:
-            metricListString += " OR error_[METRICS] = 1 \n"
+            metricListString += "error_[METRICS] = 1 OR "
+        # Check to see if the data is too old.  Default is to ignore the date.
+        # In SQLite, the date is saved as a string, so checking to see if the 
+        # the stored date is alphabetically above or below the date requested
+        # results in the correct filter.
+        if olderThan != None:
+            metricListString += "date_[METRICS] < '" + str(datetime.date.today()-datetime.timedelta(days = olderThan)) + "' OR "
+        
+        metricListString = metricListString[:-4] + ") \n"
+        
+        
+        # filter the results to only include ticker symbols at or after the
+        # user selected ticker
+        if startTicker != None:
+            startTicker = "".join(e for e in startTicker if e.isalpha()) # verify that all the text is alphabetical
+            metricListString += "AND ticker_symbol >= '" + startTicker.upper() + "' \n"
+            
+        # filter by a list of specific user added stock tickers 
         if stockList != None:
             metricListString += "AND ("
             for stock in stockList:
-                metricListString += "ticker_symbol = " + stock + " OR "
+                stock = "".join(e for e in stock if e.isalpha())
+                metricListString += "ticker_symbol = '" + stock.upper() + "' OR "
             metricListString = metricListString[:-4] + ") \n"
         
+        # dictionary that contains all the results from the search.  Each key 
+        # is a ticker, and the value is a list of the metrics that need to be 
+        # downloaded for that ticker.  This means that if a ticker only needs 
+        # one metric, that is the only metric downloaded.  
+        resultsDict = {}
+        
+        # Number of required API calls; can be used for tracking, but not currently
+        # used
+        self._apiTotalCount = 0
+        
+        # Execute the search for each metric in the database and compile the results.
         for metric in metrics:
-            columnString += ", data_[METRICS], error_[METRICS]"
-            columnString = columnString.replace("[METRICS]", conversion[metric])
-            metricString += metricListString.replace("[METRICS]", conversion[metric])
+            queryString = queryStringBase + metricListString.replace("[METRICS]", self._tableConversion[metric])
+            
+            # Limit search to only the first 'numRecords' of records from the request 
+            if numRecords == None:
+                queryString = queryString[:-1] + ";\n"
+            else:
+                queryString += "LIMIT " + str(numRecords) + ";\n"
+            
+            
+            # Execute the SQL request and convert it to a dataframe
+            query = self._cur.execute(queryString)
+            results = query.fetchall()
+            
+            # Combine the results into a dictionary of lists, where each key 
+            # is a ticker, and each value is a list of metrics.
+            for ticker in results:
+                self._apiTotalCount += 1
+                try:
+                    resultsDict[ticker[0]].append(metric)
+                except:
+                    resultsDict[ticker[0]] = [metric]
+                
+        
+        # Combine and sort the keys into a list, limiting the list of tickers 
+        # to a length of 'numRecords'
+        resultList = list(resultsDict.keys())
+        resultList.sort()
+        
+        if numRecords != None:
+            resultList = resultList[:numRecords]
+            self._apiTotalCount = 0
+            
+            for stock in resultList:
+                for metric in resultsDict[stock]:
+                    self._apiTotalCount += 1
+                
+        # Download the selected metrics from AlphaVantage for the tickers 
+        # returned from the SQL query.  
+        for stock in resultList:
+            for metric in resultsDict[stock]:
+                if metric == "time":
+                    self._getTimeSeriesDaily(stock)
+                elif metric == "balance":
+                    self._getBalanceSheet(stock)
+                elif metric == "cash":
+                    self._getCashFlow(stock)
+                elif metric == "earnings":
+                    self._getEarnings(stock)
+                elif metric == "overview":
+                    self._getFundamentalOverview(stock)
+                elif metric == "income":
+                    self._getIncomeStatement(stock)
+                self.DB.stockDB.commit()
+        
+        return 0
+
+
+
+    def confirmDatesAndCounts(self, 
+                              metrics = None, 
+                              stockList = None, 
+                              startTicker = None,
+                              endTicker = None,
+                              numRecords = None):
+        
+        # Automatically read through the SQL database and ensure that the 
+        # 'ticker_symbol_list' table has accurate information (verify error codes,
+        # dates, and amount of available data is accurate).
+        
+        # check function inputs for problematic values
+        if isinstance(stockList, str):
+            stockList = ["".join(e for e in stockList if (e.isalpha() or e == "-"))]
+        if isinstance(metrics, str):
+            metrics = ["".join(e for e in metrics if e.isalpha())]
+        if isinstance(startTicker, list):
+            startTicker = startTicker[0]
+        if isinstance(startTicker, str):
+            startTicker = ["".join(e.upper() for e in startTicker if (e.isalpha() or e == "-"))]
+        if isinstance(endTicker, list):
+            startTicker = startTicker[0]
+        if isinstance(endTicker, str):
+            endTicker = ["".join(e.upper() for e in endTicker if (e.isalpha() or e == "-"))]
+        
+        if not (isinstance(metrics, list) or metrics == None) or \
+           not (isinstance(stockList, list) or stockList == None) or \
+           not (isinstance(startTicker, str) or startTicker == None) or \
+           not (isinstance(endTicker, str) or endTicker == None) or \
+           not (isinstance(numRecords, int) or numRecords == None):
+            raise TypeError("At least one input to confirmDatesAndCounts() is not of the correct type./n")
         
         
-        queryString  = queryStringBase.replace("[METRIC_LIST]", columnString)
-        queryString += metricString
+        # default metrics to be all of the metrics; otherwise call the specific
+        # functions for the data requested.
+        if metrics == None:
+            metrics = list(self._tableConversion.keys())
         
-        query = cur.execute(queryString)
+        # "WHERE NOT 1=1 " ensures that there is at least one condition after where
+        # to prevent sytax errors at runtime.
+        queryString  = "SELECT ticker_symbol FROM ticker_symbol_list \n" +\
+                       "WHERE 1=1 \n "
+        
+        # filter the results to only include ticker symbols at or after the
+        # user selected ticker
+        if startTicker != None:
+            queryString += "AND ticker_symbol >= '" + startTicker + "' \n"
+            
+        # filter the results to only include ticker symbols before the
+        # user selected ticker
+        if endTicker != None:
+            queryString += "AND ticker_symbol <= '" + endTicker + "' \n"
+            
+        # filter by a list of specific user added stock tickers 
+        if stockList != None:
+            queryString += "AND ("
+            for stock in stockList:
+                stock = "".join(e for e in stock if e.isalpha())
+                queryString += "ticker_symbol = '" + stock.upper() + "' OR "
+            queryString = queryString[:-4] + ") \n"
+            
+        # Limit search to only the first 'numRecords' of records from the request 
+        if numRecords == None:
+            queryString = queryString[:-1] + ";\n"
+        else:
+            queryString += "LIMIT " + str(numRecords) + ";\n"
+        
+        
+        # Execute the SQL request and convert it to a dataframe and extract a 
+        # list of the tickers that need to be referenced from the other tables.
+        query = self._cur.execute(queryString)
         cols = [column[0] for column in query.description]
         results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+        tickers = list(results["ticker_symbol"])
         
-        
-        if limit == None:
-            pass
-        elif isinstance(limit, int):
-            results = results.head(limit)
-        else:
-            return -1
-                
-        for index, stock in results.iterrows():
+        # Execute the search for each metric in the database and compile the results.
+        countProgress = 0
+        for ticker in tickers:
+            
+            # construct the query string and argument list
+            queryString  = "SELECT call_time, source, status "
+            queryString += "FROM api_transactions \n"
+            queryString += "WHERE ticker_symbol = ?"
+            
+            argList = [ticker]
+            
+            query = self._cur.execute(queryString, argList)
+            cols = [column[0] for column in query.description]
+            errors = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+            
+            countProgress += 1
+            print("\rWorking ticker:  " + ticker.rjust(7) + "  " + str(countProgress-1) + " of " + str(len(tickers)) + " complete", end = "")
+            
             for metric in metrics:
-                if metric == "time":
-                    self.getTimeSeriesDaily(stock["ticker_symbol"])
-                elif metric == "balance":
-                    self.getBalanceSheet(stock["ticker_symbol"])
-                elif metric == "cash":
-                    self.getCashFlow(stock["ticker_symbol"])
-                elif metric == "earnings":
-                    self.getEarnings(stock["ticker_symbol"])
-                elif metric == "overview":
-                    self.getFundamentalOverview(stock["ticker_symbol"])
-                elif metric == "income":
-                    self.getIncomeStatement(stock["ticker_symbol"])
+                # get all the records within the table associated with a metric
+                queryString  = "SELECT ticker_symbol, recordDate "
+                queryString += "FROM " + self._tableConversion[metric] + " \n"
+                queryString += "WHERE ticker_symbol = ?"
+                
+                argList = [ticker]
+                
+                # execute the SQL query and parse the response to a pandas dataframe
+                query = self._cur.execute(queryString, argList)
+                cols = [column[0] for column in query.description]
+                results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+                
+                # count the number of records and get the most recent date of the records.
+                # also set the error code to "0", representing successful download of data
+                # if data exists, -1 if there is no record of data and no record of the 
+                # ticker in the error list, or 1 if the ticker appears in the error list.
+                if len(results["recordDate"]) > 0:
+                    count = len(results["recordDate"])
+                    recentDate = str(max(results["recordDate"]))
+                
+                    self._updateTickerList(ticker_symbol = ticker,
+                                           columnType = "ERRORCODE",
+                                           columnFunction = metric,
+                                           value = "0")
+                
+                
+                else:
+                    count = 0
+                    recentDate = ""
+                    
+                    resDF = errors[errors['source'] == self._tableConversion[metric].replace("_", " ").title()]
+                    if resDF['call_time'].count() > 0:
+                        self._updateTickerList(ticker_symbol = ticker,
+                                               columnType = "ERRORCODE",
+                                               columnFunction = metric,
+                                               value = "1")
+                        
+                    else:
+                        self._updateTickerList(ticker_symbol = ticker,
+                                               columnType = "ERRORCODE",
+                                               columnFunction = metric,
+                                               value = "-1")
+                
+                
+                self._updateTickerList(ticker_symbol = ticker,
+                                       columnType = "NUMRECORDS",
+                                       columnFunction = metric,
+                                       value = str(count))
+                
+                self._updateTickerList(ticker_symbol = ticker,
+                                       columnType = "MOSTRECENT",
+                                       columnFunction = metric,
+                                       value = recentDate)
+                
+                
 
 
+
+class getYahooData:
+    
+    def __init__(self, API_KEY = "ie3hWXyolF4uBvD5V0A8t8gZ99GWStAS5soVxZl6", dataBaseSaveFile = "./SQLiteDB/stockData.db"):
+        self.DB = database(dataBaseSaveFile) # SQL object
+        self._cur = self.DB.stockDB.cursor() # Cursor for SQL transactions
+        self._API_KEY = API_KEY  # Key for use with yahoo finance API
+        self._alphaVantageBaseURL = "https://yfapi.net/v6/finance/quote" # base URL for yahoo
+                
+        # Dictionaries that converts a user-input value to the table/columns that 
+        # should be accessed within the SQL database.  Helps to keep the 
+        # database from being corrupted by user inputs.  First dict cooresponds
+        # to the tables that align with the function calls.  The second is 
+        # used to modify the values from the first dict to match the columns in 
+        # the table 'ticker_symbol_list' (that holds a status board of sorts)
+        self._tableConversion = commonUtilities.conversionTables.tickerConversionTable
+        self._tickerListConversion = {"MOSTRECENT"  :  "date_",
+                                      "ERRORCODE"   :  "error_",
+                                      "NUMRECORDS"  :  "records_"}
+        
+        self.validate = commonUtilities.validationFunctions()
+    
+    
+    
+    def getDailyData(self, tickers = [], updateAll = False):
+        if tickers == []:
+            print("Loading Ticker List...")
+            queryString  = "SELECT ticker_symbol FROM ticker_symbol_list \n"
+            query = self._cur.execute(queryString)
+            cols = [column[0] for column in query.description]
+            results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+            tickers = list(results["ticker_symbol"])
+            print("Ticker List loaded...")
+        
+        if not updateAll:
+            print("Removing currently added tickers...")
+            queryString  = "SELECT ticker_symbol FROM yahoo_daily \n"
+            query = self._cur.execute(queryString)
+            cols = [column[0] for column in query.description]
+            results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+            existingTickers = list(results["ticker_symbol"])
+            tickers = list(set(tickers) - set(existingTickers))
+            tickers.sort()
+            print("Ticker list reconciled.")
+        
+                    
+        print("Removing unavailable tickers...")
+        queryString  = "SELECT ticker_symbol FROM yahoo_missing \n"
+        query = self._cur.execute(queryString)
+        cols = [column[0] for column in query.description]
+        results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+        existingTickers = list(results["ticker_symbol"])
+        tickers = list(set(tickers) - set(existingTickers))
+        tickers.sort()
+        print("Removed Missing Tickers.")
+        
+        
+        count = 0
+        totalCount = len(tickers)
+        for ticker in tickers: 
+            count += 1
+            
+            print("\rRequesting ticker:   " + str(ticker).rjust(6) + "   (" + str(count).rjust(6) + " of " + str(totalCount).ljust(6) + ")               ", end = "")
+            url  = "https://query1.finance.yahoo.com/v7/finance/download/" + str(ticker)
+            url += "?period1=315619200&period2=" + str(int(datetime.datetime.now().timestamp()))
+            url += "&interval=1d&events=history&includeAdjustedClose=true"
+            try:
+                data = pd.read_csv(url)
+            except Exception as e:
+                print("\rError on ticker:     " + str(ticker).rjust(6) + ":     " + str(e) + ".                  ")
+                if "Unauthorized" in str(e):
+                    raise callLimitExceeded("API limit exceeded after " + str(count).rjust(6) + "   itterations on ticker:   " + str(ticker) + ". ")
+                if "Not Found" in str(e):
+                    self.insertMissing(ticker = ticker, error = "HTTPError: Not Found")
+                continue
+            
+            if data.empty:
+                print("\n   Ticker " + str(ticker).rjust(6) + "  empty.                                ")
+                continue
+            
+            data.rename({"Open": "open",
+                         "High": "high",
+                         "Low": "low",
+                         "Close": "close",
+                         "Adj Close": "adj_close",
+                         "Volume": "volume",
+                         "Date": "recordDate"}, axis=1, inplace=True)
+            
+            data['ticker_symbol'] = str(ticker)
+            
+            # save the data to the SQLite database
+            self.saveYahooToSQL(stockDF = data, ticker_symbol = ticker)
+            
+        print("\nData Collection Complete.")
+        return False
+        
+        
+        
+        
+    def saveYahooToSQL(self, stockDF, ticker_symbol = ""):
+        # Saves a dataframe to the SQLite database.  Functions as a wrapper for
+        # this class and its dataframes.  The dataframes and SQLite schema were
+        # setup to match and work well together.
+        
+        # Create an entry for in the respective table for the API call that was made 
+        insert_string  = "INSERT OR IGNORE INTO yahoo_daily "
+        insert_string += " (ticker_symbol, recordDate) "
+        insert_string += "VALUES(?, ?) \n"
+        insert_list = stockDF[["ticker_symbol", "recordDate"]].values.tolist()
+                
+        self._cur.executemany(insert_string, insert_list)
+        self.DB.stockDB.commit()
+        
+        
+        # Update the record created above with the other data passed to the function.
+        update_string = "UPDATE yahoo_daily SET \n"
+        argList = pd.DataFrame()
+        
+        for key in stockDF.keys():
+            if key not in ["ticker_symbol", "recordDate"]:
+                update_string += "  " + key + " = ?,\n"
+                argList[key] = stockDF[key]
+        
+        # Add 'where' clause to the SQL transaction to ensure that the correct record is altered.
+        update_string = update_string[:-2] + "\nWHERE "
+        update_string += "ticker_symbol = ? \n"
+        update_string += "AND recordDate = ?; \n"
+        argList["ticker_symbol"] = stockDF["ticker_symbol"]
+        argList["recordDate"] = stockDF["recordDate"]
+        
+        argList = argList.values.tolist()
+        
+        self._cur.executemany(update_string, argList)
+        self.DB.stockDB.commit()
+    
+    
+    
+    def insertMissing(self, ticker, error = ""):
+        callTime = str(datetime.datetime.now().timestamp())
+        callDate = str(datetime.date.today())
+        
+        insert_string  = "INSERT OR IGNORE INTO yahoo_missing "
+        insert_string += " (ticker_symbol, error, call_time, call_date) "
+        insert_string += "VALUES(?, ?, ?, ?) \n"
+        insert_list = [ticker, error, callTime, callDate]
+        
+        self._cur.execute(insert_string, insert_list)
+        self.DB.stockDB.commit()
+
+    def sleep(self, interval = 0):
+        print()
+        while interval >= 0:
+            print("\r sleeping for  " + str(interval).rjust(6) + "  seconds.              ", end = "")
+            time.sleep(1)
+            interval -= 1
+        print()
+
+
+class processTools:
+    
+    def _checkIfProcessRunning(self, processName):
+        # Check if there is any running process that contains the given name 
+        # processName.  
+        
+        #Iterate over the all the running process
+        for proc in psutil.process_iter():
+            try:
+                # Check if process name contains the given name string.
+                if processName.lower() in proc.name().lower():
+                    return proc
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        return False;
+    
+    
+    
+    def resetVPN(self):
+        print("\n\n   Stopping VPN...")
+        process = self.tools._checkIfProcessRunning("nsv")  # look for the Norton VPN service
+        while process != False: # keep looking until the service is found
+            vpnKillStatus = os.system("schtasks /run /tn killVPN")
+            # stops the norton vpn I am using. The command line needs
+            # run "taskkill /f /im NSV.exe" as an administrator.  This 
+            # command is contained in a batch file that is then added to
+            # to the windows scheduler as an "on demand" task.  This task
+            # is then executed via the line above to avoid the need for
+            # the user (i.e. me) to provide permission for the batch file
+            # to run.  The output is assigned to 'vpnKillStatus', which 
+            # is 0 if completed successfully and 1 otherwise.
+            
+            if vpnKillStatus == 1:
+                raise vpnResetFailed("\nScheduled Task failed to complete successfully.\n")
+            
+            # This opens a security vulnerability if the batch file is altered.
+            time.sleep(3) # helps to keep from confusing the VPN.  3 was pulled from thin air.
+            process = self.tools._checkIfProcessRunning("nsv") # look for the Norton VPN service
+        
+        
+        print("   Restarting VPN...")
+        while process == False:  # if the Norton VPN process doeesn't exist (not runninng), 'process' will be false
+            # Call the OS to start Norton VPN.  The VPN is setup to automatically connect to the servers.
+            os.system('"C:\\Program Files\\NortonSecureVPN\\Engine\\5.1.1.5\\nsvUIStub.exe"')
+            time.sleep(5)
+            process = self.tools._checkIfProcessRunning("nsv")
+        
+        print("   Resetting API call counter...")
+        # reset the API calls and call times.
+        self._resetTotalApiCalls()
+        apiCallTime = time.time() - 60
+        self._apiRecentCallTimes = [apiCallTime for i in range(self._rate)]
+        print("   API call counter reset.")
+        print("   VPN restart complete.\n\n")
+        
+        return 0    
+    
+    
+    
+    def loadStockListCSV(self, stockListFileName, saveToDB = True):
+        # reads a csv file of stock tickers and optionally saves them to 
+        # 'ticker_symbol_list' table in the database.
+        try:
+            # Open the csv-based list of tickers/companies
+            stockFile = open(stockListFileName, "r") 
+            
+        except:
+            print("Bad stock list file.  Unable to open.")
+            return 1
+        
+        # read each line and create a list for the outputs
+        Lines = stockFile.readlines()
+        
+        DF_ticker = [] # ticker symbol list
+        DF_name = [] # name of the company
+        DF_exchange = [] # exchange that the stock is traded on
+        DF_recordDate = [] # date that the ticker was added to the database
+        
+        # open each line, split on the comma to get each value, append the 
+        # ticker, name, and exchange from the CSV to the lists, and add today's
+        # date to the record date.  
+        for line in Lines:
+            stock = line.split(",")
+            DF_ticker.append(stock[0])
+            DF_name.append(stock[1])
+            DF_exchange.append(stock[2].strip('\n'))
+            DF_recordDate.append(datetime.date.today())
+            
+            # execute a save to the 'ticker_symbol_list' table.
+            if saveToDB:
+                self._updateTickerList(ticker_symbol = stock[0],
+                                       name = stock[1],
+                                       exchange = stock[2].strip("\n"),
+                                       recordDate = str(datetime.date.today()))
+            
+        # create the dataframe with all the recorded data
+        df = pd.DataFrame([DF_ticker,
+                           DF_recordDate,
+                           DF_name,
+                           DF_exchange])
+        
+        # label the data
+        df.index = ["ticker_symbol", "recordDate", "name", "exchange"]
+        df = df.transpose()
+        
+        # return the data
+        return df
+    
 
 
 
 class database:
-    def __init__(self, databaseSaveFile = "SQLiteDB/stockData.db"):
-        if(os.path.exists(databaseSaveFile)):
-            self.stockDB = sqlite3.connect(databaseSaveFile)
+    def __init__(self, dataBaseSaveFile = "SQLiteDB/stockData.db"):
+        if(os.path.exists(dataBaseSaveFile)):
+            self.stockDB = sqlite3.connect(dataBaseSaveFile)
         else:
             try:
-                self.stockDB = self.createStockDatabase(databaseSaveFile)
+                self.stockDB = self.createStockDatabase(dataBaseSaveFile)
                 self.DBcursor = self.stockDB.cursor()
             except:
                 print("Failed to connect to stock database.")
@@ -804,255 +1591,325 @@ class database:
         print("Opened database successfully.")
         
         
-        cur.execute('''CREATE TABLE fund_overview (
-                id                          INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol               TEXT       NOT NULL,
-                recordDate                  TEXT       NOT NULL,
-                cik                         INTEGER    NOT NULL,
-                name						TEXT       NOT NULL,
-                assetType					TEXT,
-                description					TEXT,
-                exchange					TEXT,
-                currency					TEXT,
-                country						TEXT,
-                sector						TEXT,
-                industry					TEXT,
-                address						TEXT,
-                fiscalYearEnd				TEXT,
-                latestQuarter				TEXT,
-                marketCapitalization		INTEGER,
-                ebitda						INTEGER,
-                peRatio						REAL,
-                pegRatio					REAL,
-                bookValue					REAL,
-                dividendPerShare			REAL,
-                dividendYield				REAL,
-                eps							REAL,
-                revenuePerShareTTM			REAL,
-                profitMargin				REAL,
-                operatingMarginTTM			REAL,
-                returnOnAssetsTTM			REAL,
-                returnOnEquityTTM			REAL,
-                revenueTTM					INTEGER,
-                grossProfitTTM				INTEGER,
-                dilutedEPSTTM				REAL,
-                quarterlyEarningsGrowthYOY	REAL,
-                quarterlyRevenueGrowthYOY	REAL,
-                analystTargetPrice			REAL,
-                trailingPE					REAL,
-                forwardPE					REAL,
-                priceToSalesRatioTTM		REAL,
-                priceToBookRatio			REAL,
-                evToRevenue					REAL,
-                evToEBITDA					REAL,
-                beta						REAL,
-                high_52week					REAL,
-                low_52week					REAL,
-                moving_average_50d			REAL,
-                moving_average_200d			REAL,
-                sharesOutstanding			INTEGER,
-                sharesFloat     			INTEGER,
-                sharesShort    			    INTEGER,
-                sharesShortPriorMonth	    INTEGER,
-                shortRatio                  REAL,
-                shortPercentOutstanding     REAL,
-                shortPercentFloat           REAL,
-                percentInsiders             REAL,
-                percentInstitutions         REAL,
-                forwardAnnualDividendRate   REAL,
-                forwardAnnualDividendYield  REAL,
-                payoutRatio                 REAL,
-                lastSplitFactor             REAL,
-                lastSplitDate               TEXT,
-                dividendDate				TEXT,
-                exDividendDate				TEXT,
-                UNIQUE(recordDate, ticker_symbol) ON CONFLICT REPLACE );''')
+        cur.execute('''CREATE TABLE fundamental_overview (
+                        id                         INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol              TEXT        NOT NULL,
+                        recordDate                 TEXT        NOT NULL,
+                        cik                        INTEGER     NOT NULL,
+                        name                       TEXT        NOT NULL,
+                        assetType                  TEXT,
+                        description                TEXT,
+                        exchange                   TEXT,
+                        currency                   TEXT,
+                        country                    TEXT,
+                        sector                     TEXT,
+                        industry                   TEXT,
+                        address                    TEXT,
+                        fiscalYearEnd              TEXT,
+                        latestQuarter              TEXT,
+                        marketCapitalization       INTEGER,
+                        ebitda                     INTEGER,
+                        peRatio                    REAL,
+                        pegRatio                   REAL,
+                        bookValue                  REAL,
+                        dividendPerShare           REAL,
+                        dividendYield              REAL,
+                        eps                        REAL,
+                        revenuePerShareTTM         REAL,
+                        profitMargin               REAL,
+                        operatingMarginTTM         REAL,
+                        returnOnAssetsTTM          REAL,
+                        returnOnEquityTTM          REAL,
+                        revenueTTM                 INTEGER,
+                        grossProfitTTM             INTEGER,
+                        dilutedEPSTTM              REAL,
+                        quarterlyEarningsGrowthYOY REAL,
+                        quarterlyRevenueGrowthYOY  REAL,
+                        analystTargetPrice         REAL,
+                        trailingPE                 REAL,
+                        forwardPE                  REAL,
+                        priceToSalesRatioTTM       REAL,
+                        priceToBookRatio           REAL,
+                        evToRevenue                REAL,
+                        evToEBITDA                 REAL,
+                        beta                       REAL,
+                        high_52week                REAL,
+                        low_52week                 REAL,
+                        moving_average_50d         REAL,
+                        moving_average_200d        REAL,
+                        sharesOutstanding          INTEGER,
+                        sharesFloat                INTEGER,
+                        sharesShort                INTEGER,
+                        sharesShortPriorMonth      INTEGER,
+                        shortRatio                 REAL,
+                        shortPercentOutstanding    REAL,
+                        shortPercentFloat          REAL,
+                        percentInsiders            REAL,
+                        percentInstitutions        REAL,
+                        forwardAnnualDividendRate  REAL,
+                        forwardAnnualDividendYield REAL,
+                        payoutRatio                REAL,
+                        lastSplitFactor            REAL,
+                        lastSplitDate              TEXT,
+                        dividendDate               TEXT,
+                        exDividendDate             TEXT,
+                        CONSTRAINT ticker_date_constraint UNIQUE (
+                            ticker_symbol ASC,
+                            recordDate
+                        )
+                        ON CONFLICT IGNORE);  ''')
         
         
                 
         cur.execute('''CREATE TABLE daily_adjusted (
-                id                  INTEGER     PRIMARY KEY      AUTOINCREMENT,
-                ticker_symbol       TEXT        NOT NULL,
-                recordDate          TEXT        NOT NULL,
-                open                REAL,
-                high                REAL,
-                low                 REAL,
-                close               REAL,
-                adj_close           REAL,
-                volume              REAL,
-                dividend            REAL,
-                split               REAL,
-                UNIQUE(recordDate, ticker_symbol) ON CONFLICT REPLACE );''')
+                        id               INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol    TEXT,
+                        recordDate       TEXT,
+                        open             REAL,
+                        high             REAL,
+                        low              REAL,
+                        close            REAL,
+                        adj_close        REAL,
+                        volume           REAL,
+                        dividend         REAL,
+                        split            REAL,
+                        adjustment_ratio REAL,
+                        mvng_avg_20      REAL,
+                        mvng_avg_50      REAL,
+                        macd_12_26       REAL,
+                        macd_19_39       REAL,
+                        vol_avg_20       REAL,
+                        vol_avg_50       REAL,
+                        on_bal_vol       REAL,
+                        percent_cng_day  REAL,
+                        percent_cng_tot  REAL,
+                        rsi              REAL,
+                        CONSTRAINT ticker_date_constraint UNIQUE (
+                            ticker_symbol ASC,
+                            recordDate
+                        )
+                        ON CONFLICT IGNORE);  ''')
 
         
         
         cur.execute('''CREATE TABLE income_statement (
-                id                                 INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol                      TEXT       NOT NULL,
-                recordDate                         TEXT       NOT NULL,
-                annualReport                       INTEGER    NOT NULL,
-                reportedCurrency                   TEXT,
-                grossProfit                        REAL,
-                totalRevenue                       INTEGER,
-                costOfRevenue                      INTEGER,
-                costofGoodsAndServicesSold         INTEGER,
-                operatingIncome                    INTEGER,
-                sellingGeneralAndAdministrative    INTEGER,
-                researchAndDevelopment             INTEGER,
-                operatingExpenses                  INTEGER,
-                investmentIncomeNet                INTEGER,
-                netInterestIncome                  INTEGER,
-                interestIncome                     INTEGER,
-                interestExpense                    INTEGER,
-                nonInterestIncome                  INTEGER,
-                otherNonOperatingIncome            INTEGER,
-                depreciation                       INTEGER,
-                depreciationAndAmortization        INTEGER,
-                incomeBeforeTax                    INTEGER,
-                incomeTaxExpense                   INTEGER,
-                interestAndDebtExpense             INTEGER,
-                netIncomeFromContinuingOperations  INTEGER,
-                comprehensiveIncomeNetOfTax        INTEGER,
-                ebit                               INTEGER,
-                ebitda                             INTEGER,
-                netIncome                          INTEGER,
-                UNIQUE(recordDate, ticker_symbol, annualReport) ON CONFLICT REPLACE );''')
+                        id                                INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol                     TEXT        NOT NULL,
+                        recordDate                        TEXT        NOT NULL,
+                        annualReport                      INTEGER     NOT NULL,
+                        reportedCurrency                  TEXT,
+                        grossProfit                       REAL,
+                        totalRevenue                      INTEGER,
+                        costOfRevenue                     INTEGER,
+                        costofGoodsAndServicesSold        INTEGER,
+                        operatingIncome                   INTEGER,
+                        sellingGeneralAndAdministrative   INTEGER,
+                        researchAndDevelopment            INTEGER,
+                        operatingExpenses                 INTEGER,
+                        investmentIncomeNet               INTEGER,
+                        netInterestIncome                 INTEGER,
+                        interestIncome                    INTEGER,
+                        interestExpense                   INTEGER,
+                        nonInterestIncome                 INTEGER,
+                        otherNonOperatingIncome           INTEGER,
+                        depreciation                      INTEGER,
+                        depreciationAndAmortization       INTEGER,
+                        incomeBeforeTax                   INTEGER,
+                        incomeTaxExpense                  INTEGER,
+                        interestAndDebtExpense            INTEGER,
+                        netIncomeFromContinuingOperations INTEGER,
+                        comprehensiveIncomeNetOfTax       INTEGER,
+                        ebit                              INTEGER,
+                        ebitda                            INTEGER,
+                        netIncome                         INTEGER,
+                        CONSTRAINT ticker_date_report_constraint UNIQUE (
+                            ticker_symbol ASC,
+                            recordDate,
+                            annualReport
+                        )
+                        ON CONFLICT IGNORE);  ''')
                  
         
         
-        cur.execute('''CREATE TABLE  balance_sheet (
-                id                                      INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol                           TEXT       NOT NULL,
-                recordDate      						TEXT       NOT NULL,
-                annualReport                            INTEGER    NOT NULL,
-                reportedCurrency						TEXT,
-                totalAssets								INTEGER,
-                totalCurrentAssets						INTEGER,
-                cashAndCashEquivalentsAtCarryingValue	INTEGER,
-                cashAndShortTermInvestments				INTEGER,
-                inventory								INTEGER,
-                currentNetReceivables					INTEGER,
-                totalNonCurrentAssets					INTEGER,
-                propertyPlantEquipment					INTEGER,
-                accumulatedDepreciationAmortizationPPE	INTEGER,
-                intangibleAssets						INTEGER,
-                intangibleAssetsExcludingGoodwill		INTEGER,
-                goodwill								INTEGER,
-                investments								INTEGER,
-                longTermInvestments						INTEGER,
-                shortTermInvestments					INTEGER,
-                otherCurrentAssets						INTEGER,
-                otherNonCurrrentAssets					INTEGER,
-                totalLiabilities						INTEGER,
-                totalCurrentLiabilities					INTEGER,
-                currentAccountsPayable					INTEGER,
-                deferredRevenue							INTEGER,
-                currentDebt								INTEGER,
-                shortTermDebt							INTEGER,
-                totalNonCurrentLiabilities				INTEGER,
-                capitalLeaseObligations					INTEGER,
-                longTermDebt							INTEGER,
-                currentLongTermDebt						INTEGER,
-                longTermDebtNoncurrent					INTEGER,
-                shortLongTermDebtTotal					INTEGER,
-                otherCurrentLiabilities					INTEGER,
-                otherNonCurrentLiabilities				INTEGER,
-                totalShareholderEquity					INTEGER,
-                treasuryStock							INTEGER,
-                retainedEarnings						INTEGER,
-                commonStock								INTEGER,
-                commonStockSharesOutstanding			INTEGER,
-                UNIQUE(recordDate, ticker_symbol, annualReport) ON CONFLICT REPLACE );''')
+        cur.execute('''CREATE TABLE balance_sheet (
+                        id                                     INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol                          TEXT        NOT NULL,
+                        recordDate                             TEXT        NOT NULL,
+                        annualReport                           INTEGER     NOT NULL,
+                        reportedCurrency                       TEXT,
+                        totalAssets                            INTEGER,
+                        totalCurrentAssets                     INTEGER,
+                        cashAndCashEquivalentsAtCarryingValue  INTEGER,
+                        cashAndShortTermInvestments            INTEGER,
+                        inventory                              INTEGER,
+                        currentNetReceivables                  INTEGER,
+                        totalNonCurrentAssets                  INTEGER,
+                        propertyPlantEquipment                 INTEGER,
+                        accumulatedDepreciationAmortizationPPE INTEGER,
+                        intangibleAssets                       INTEGER,
+                        intangibleAssetsExcludingGoodwill      INTEGER,
+                        goodwill                               INTEGER,
+                        investments                            INTEGER,
+                        longTermInvestments                    INTEGER,
+                        shortTermInvestments                   INTEGER,
+                        otherCurrentAssets                     INTEGER,
+                        otherNonCurrrentAssets                 INTEGER,
+                        totalLiabilities                       INTEGER,
+                        totalCurrentLiabilities                INTEGER,
+                        currentAccountsPayable                 INTEGER,
+                        deferredRevenue                        INTEGER,
+                        currentDebt                            INTEGER,
+                        shortTermDebt                          INTEGER,
+                        totalNonCurrentLiabilities             INTEGER,
+                        capitalLeaseObligations                INTEGER,
+                        longTermDebt                           INTEGER,
+                        currentLongTermDebt                    INTEGER,
+                        longTermDebtNoncurrent                 INTEGER,
+                        shortLongTermDebtTotal                 INTEGER,
+                        otherCurrentLiabilities                INTEGER,
+                        otherNonCurrentLiabilities             INTEGER,
+                        totalShareholderEquity                 INTEGER,
+                        treasuryStock                          INTEGER,
+                        retainedEarnings                       INTEGER,
+                        commonStock                            INTEGER,
+                        commonStockSharesOutstanding           INTEGER,
+                        CONSTRAINT ticker_date_report_constraint UNIQUE (
+                            ticker_symbol ASC,
+                            recordDate,
+                            annualReport
+                        )
+                        ON CONFLICT IGNORE);  ''')
 
 
 
-        cur.execute('''CREATE TABLE  earnings (
-                id                      INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol           TEXT       NOT NULL,
-                recordDate      		TEXT       NOT NULL,
-                reportedDate			TEXT,
-                reportedEPS				INTEGER,
-                estimatedEPS			INTEGER,
-                surprise				INTEGER,
-                surprisePercentage		INTEGER,
-                UNIQUE(recordDate, ticker_symbol) ON CONFLICT REPLACE );''')
+        cur.execute('''CREATE TABLE earnings (
+                        id                 INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol      TEXT        NOT NULL,
+                        recordDate         TEXT        NOT NULL,
+                        reportedDate       TEXT,
+                        reportedEPS        INTEGER,
+                        estimatedEPS       INTEGER,
+                        surprise           INTEGER,
+                        surprisePercentage INTEGER,
+                        CONSTRAINT ticker_date_constraint UNIQUE (
+                            ticker_symbol ASC,
+                            recordDate
+                        )
+                        ON CONFLICT IGNORE);   ''')
 
 
 
-        cur.execute('''CREATE TABLE  cash_flow (
-                id                                      INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol                           TEXT       NOT NULL,
-                recordDate      						TEXT       NOT NULL,
-                annualReport                            INTEGER    NOT NULL,
-                reportedCurrency						TEXT,
-                operatingCashflow						INTEGER,
-                paymentsForOperatingActivities			INTEGER,
-                proceedsFromOperatingActivities			INTEGER,
-                changeInOperatingLiabilities			INTEGER,
-                changeInOperatingAssets					INTEGER,
-                depreciationDepletionAndAmortization	INTEGER,
-                capitalExpenditures						INTEGER,
-                changeInReceivables						INTEGER,
-                changeInInventory						INTEGER,
-                profitLoss								INTEGER,
-                cashflowFromInvestment					INTEGER,
-                cashflowFromFinancing					INTEGER,
-                proceedsFromRepaymentsOfShortTermDebt	INTEGER,
-                paymentsForRepurchaseOfCommonStock		INTEGER,
-                paymentsForRepurchaseOfEquity			INTEGER,
-                paymentsForRepurchaseOfPreferredStock	INTEGER,
-                dividendPayout							INTEGER,
-                dividendPayoutCommonStock				INTEGER,
-                dividendPayoutPreferredStock			INTEGER,
-                proceedsFromIssuanceOfCommonStock		INTEGER,
-                proceedsFromIssuanceOfLongTermDebt		INTEGER,
-                proceedsFromIssuanceOfPreferredStock	INTEGER,
-                proceedsFromRepurchaseOfEquity			INTEGER,
-                proceedsFromSaleOfTreasuryStock			INTEGER,
-                changeInCashAndCashEquivalents			INTEGER,
-                changeInExchangeRate					INTEGER,
-                netIncome								INTEGER,
-                UNIQUE(recordDate, ticker_symbol, annualReport) ON CONFLICT REPLACE );''')
+        cur.execute('''CREATE TABLE cash_flow (
+                        id                                    INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol                         TEXT        NOT NULL,
+                        recordDate                            TEXT        NOT NULL,
+                        annualReport                          INTEGER     NOT NULL,
+                        reportedCurrency                      TEXT,
+                        operatingCashflow                     INTEGER,
+                        paymentsForOperatingActivities        INTEGER,
+                        proceedsFromOperatingActivities       INTEGER,
+                        changeInOperatingLiabilities          INTEGER,
+                        changeInOperatingAssets               INTEGER,
+                        depreciationDepletionAndAmortization  INTEGER,
+                        capitalExpenditures                   INTEGER,
+                        changeInReceivables                   INTEGER,
+                        changeInInventory                     INTEGER,
+                        profitLoss                            INTEGER,
+                        cashflowFromInvestment                INTEGER,
+                        cashflowFromFinancing                 INTEGER,
+                        proceedsFromRepaymentsOfShortTermDebt INTEGER,
+                        paymentsForRepurchaseOfCommonStock    INTEGER,
+                        paymentsForRepurchaseOfEquity         INTEGER,
+                        paymentsForRepurchaseOfPreferredStock INTEGER,
+                        dividendPayout                        INTEGER,
+                        dividendPayoutCommonStock             INTEGER,
+                        dividendPayoutPreferredStock          INTEGER,
+                        proceedsFromIssuanceOfCommonStock     INTEGER,
+                        proceedsFromIssuanceOfLongTermDebt    INTEGER,
+                        proceedsFromIssuanceOfPreferredStock  INTEGER,
+                        proceedsFromRepurchaseOfEquity        INTEGER,
+                        proceedsFromSaleOfTreasuryStock       INTEGER,
+                        changeInCashAndCashEquivalents        INTEGER,
+                        changeInExchangeRate                  INTEGER,
+                        netIncome                             INTEGER,
+                        CONSTRAINT ticker_date_report_constraint UNIQUE (
+                            ticker_symbol ASC,
+                            recordDate,
+                            annualReport
+                        )
+                        ON CONFLICT IGNORE  );''')
         
         
         
-        cur.execute('''CREATE TABLE  errors_tracker (
-                id                                      INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol                           TEXT       NOT NULL,
-                recordTime                              REAL       NOT NULL,
-                recordDate      						TEXT,
-                errorType      						    TEXT,
-                errorSource      						TEXT,
-                errorMessage      						TEXT,
-                UNIQUE(recordTime, ticker_symbol) ON CONFLICT FAIL );''')
+        cur.execute('''CREATE TABLE api_transactions (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticker_symbol TEXT    NOT NULL,
+                        call_time     REAL    NOT NULL,
+                        call_date     TEXT,
+                        type          TEXT,
+                        source        TEXT,
+                        message       TEXT,
+                        status        TEXT,
+                        CONSTRAINT ticker_time_constraint UNIQUE (
+                            ticker_symbol,
+                            call_time
+                        )
+                        ON CONFLICT FAIL );''')
         
         
         
         cur.execute('''CREATE TABLE ticker_symbol_list (
-                id                          INTEGER    PRIMARY KEY    AUTOINCREMENT,
-                ticker_symbol               TEXT       NOT NULL,
-                recordDate      			TEXT       NOT NULL,
-                name                        TEXT,
-                exchange                    TEXT,
-                
-                hist_length                 INTEGER    DEFAULT -1      NOT NULL,
-                error_fund_overview         INTEGER    DEFAULT -1      NOT NULL,
-                error_income_statement      INTEGER    DEFAULT -1      NOT NULL,
-                error_earnings              INTEGER    DEFAULT -1      NOT NULL,
-                error_daily_adjusted        INTEGER    DEFAULT -1      NOT NULL,
-                error_balance_sheet         INTEGER    DEFAULT -1      NOT NULL,
-                error_cash_flow             INTEGER    DEFAULT -1      NOT NULL,
-                
-                data_fund_overview          TEXT,
-                data_income_statement       TEXT,
-                data_earnings               TEXT,
-                data_daily_adjusted         TEXT,
-                data_balance_sheet          TEXT,
-                data_cash_flow              TEXT,
-                
-                UNIQUE(ticker_symbol) ON CONFLICT IGNORE );''')
+                        id                           INTEGER     PRIMARY KEY     AUTOINCREMENT,
+                        ticker_symbol                TEXT        NOT NULL,
+                        recordDate                   TEXT        NOT NULL,
+                        name                         TEXT,
+                        exchange                     TEXT,
+                        error_fundamental_overview   INTEGER DEFAULT -1      NOT NULL,
+                        error_income_statement       INTEGER DEFAULT -1      NOT NULL,
+                        error_earnings               INTEGER DEFAULT -1      NOT NULL,
+                        error_daily_adjusted         INTEGER DEFAULT -1      NOT NULL,
+                        error_balance_sheet          INTEGER DEFAULT -1      NOT NULL,
+                        error_cash_flow              INTEGER DEFAULT -1      NOT NULL,
+                        date_fundamental_overview    TEXT,
+                        date_income_statement        TEXT,
+                        date_earnings                TEXT,
+                        date_daily_adjusted          TEXT,
+                        date_balance_sheet           TEXT,
+                        date_cash_flow               TEXT,
+                        records_fundamental_overview INTEGER,
+                        records_income_statement     INTEGER,
+                        records_earnings             INTEGER,
+                        records_daily_adjusted       INTEGER,
+                        records_balance_sheet        INTEGER,
+                        records_cash_flow            INTEGER,
+                        CONSTRAINT ticker_constraint UNIQUE (ticker_symbol ASC)
+                        ON CONFLICT IGNORE ); ''')
         
         
+        
+        cur.execute('''CREATE TABLE summary_data (
+                        id                  INTEGER      PRIMARY KEY      AUTOINCREMENT      UNIQUE,
+                        ticker_symbol       TEXT         NOT NULL,
+                        date_calculated     TEXT         NOT NULL,
+                        daily_length        INTEGER,
+                        market_cap          REAL,
+                        sector              TEXT,
+                        exchange            TEXT,
+                        country             TEXT,
+                        industry            TEXT,
+                        pe_ratio            REAL,
+                        profit_margin       REAL,
+                        share_holder_equity REAL,
+                        earnings_per_share  REAL,
+                        avg_return          REAL,
+                        std_return          REAL,                    
+                        comp_return         REAL,
+                        comp_stddev         REAL,                    
+                        max_daily_change    REAL,
+                        min_daily_change    REAL,
+                        CONSTRAINT ticker_constraint UNIQUE (ticker_symbol ASC)
+                        ON CONFLICT IGNORE );  ''')
+
         
         print("Schema created successfully.")
         
@@ -1061,167 +1918,36 @@ class database:
 
 
 if __name__ == "__main__":
-    t_start = time.time()
+    # t_start = time.time()
     
-    info = getData()
-    cur = info.DB.stockDB.cursor()
+    # info = getAlphaVantageData()
     
+    # info.confirmDatesAndCounts()
     
-    # df_0 = info.loadStockListCSV("TotalStockList.csv", True)
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM ticker_symbol_list")
-    # rows_0 = cur.fetchall()
+    # info.tools.resetVPN()
     
-    # count = 0
-    # for i in rows_0:
-    #     count += 1
-    # print("Rows in Ticker List:  " + str(count))
+    # complete = 1
     
-    # info.copyPickleToSQL("./Stocks/")
-    info.autoUpdate()
+    # while(complete != 0):
+    #     try:
+    #         complete = info.autoUpdate(stockList=["ERAO"])
+    #     except callLimitExceeded:
+    #         pass
+    #         # info.tools.resetVPN()
     
-    t_1 = time.time()
-    
-    
-    # info.loadStockListCSV("TotalStockList.csv", True)
-    # info.copyPickleToSQL("./Stocks/")
-    
-    # cur.execute("SELECT * FROM ticker_symbol_list")
-    # tickers = cur.fetchall()
-    
-    # cur.execute("SELECT * FROM daily_adjusted")
-    # daily = cur.fetchall()
-    
-    # cur.execute("SELECT * FROM balance_sheet")
-    # balance = cur.fetchall()
-    
-    # cur.execute("SELECT * FROM cash_flow")
-    # cash = cur.fetchall()
-    
-    # cur.execute("SELECT * FROM earnings")
-    # earnings = cur.fetchall()
-    
-    # cur.execute("SELECT * FROM fund_overview")
-    # overview = cur.fetchall()
-    
-    # cur.execute("SELECT * FROM income_statement")
-    # income = cur.fetchall()
-    
-    
-    t_2 = time.time()
-    
-    
-    # df_1 = info.getCashFlow('TSLA')
-    # cur.execute("SELECT * FROM cash_flow")
-    # rows_1 = cur.fetchall()
-    
-    # count = 0
-    # for i in rows_1:
-    #     count += 1
-    # print("Rows in Cash Statement table:  " + str(count))
-    
-
-    # df_2 = info.getTimeSeriesDaily('TSLA')
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM daily_adjusted")
-    # rows_2 = cur.fetchall()
-    
-    # count = 0
-    # for i in rows_2:
-    #     count += 1
-    # print("Rows in Daily Price table:  " + str(count))
+    # t_1 = time.time()
 
 
-    # df_3 = info.getFundamentalOverview('TSLA')
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM fund_overview")
-    # rows_3 = cur.fetchall()
+    info = getYahooData()
     
-    # count = 0
-    # for i in rows_3:
-    #     count += 1
-    # print("Rows in Fundamental table:  " + str(count))
-
-
-    # df_4 = info.getEarnings('TSLA')
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM earnings")
-    # rows_4 = cur.fetchall()
+    notDone = True
     
-    # count = 0
-    # for i in rows_4:
-    #     count += 1
-    # print("Rows in Earnings table:  " + str(count))
-    
-    
-    # df_5 = info.getIncomeStatement('TSLA')
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM income_statement")
-    # rows_5 = cur.fetchall()
-    
-    # count = 0
-    # for i in rows_5:
-    #     count += 1
-    # print("Rows in Income table:  " + str(count))
-    
-    
-    
-    # df_6 = info.getBalanceSheet('TSLA')
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM balance_sheet")
-    # rows_6 = cur.fetchall()
-    
-    # count = 0
-    # for i in rows_6:
-    #     count += 1
-    # print("Rows in Balance Sheet table:  " + str(count))
-    
-    
-    
-    # info.getBalanceSheet('AFTM')
-    # info.getTimeSeriesDaily('AFTM')
-    # info.getCashFlow('AFTM')
-    # info.getFundamentalOverview('AFTM')
-    # info.getIncomeStatement('AFTM')
-    # info.getEarnings('AFTM')
-    
-    
-    
-    # cur = info.DB.stockDB.cursor()
-    # cur.execute("SELECT * FROM errors_tracker")
-    # rows_e = cur.fetchall()
-    
-    # print("Rows in Ticker List:  " + str(len(rows_e)))
-    
-    
-    # query = cur.execute("SELECT * FROM ticker_symbol_list")
-    # cols = [column[0] for column in query.description]
-    # results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
-    
-    
-    t_end = time.time()
-
-
-    # alphaVantageBaseURL = "https://www.alphavantage.co/query?"
-    # API_KEY = "NYLUQRD89OVSIL3I"
-    # ticker_symbol = "TSLA"
-    # requestURL = alphaVantageBaseURL + "function=TIME_SERIES_DAILY_ADJUSTED&" + \
-    #                   "outputsize=full&symbol=" + ticker_symbol + "&apikey=" + API_KEY
-    
-    # for i in range(1):
-    #     response = requests.get(requestURL)
-    #     data = response.json()
-
-    
-    # info = getData()
-    # cur = info.DB.stockDB.cursor()
-    
-    # query = cur.execute("SELECT * FROM ticker_symbol_list WHERE error_fund_overview = -1")
-    # cols = [column[0] for column in query.description]
-    # results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
-    
-    # for index, stock in results.iterrows():
-    #     info.getFundamentalOverview(stock["ticker_symbol"])
+    while notDone:
+        try:
+            notDone = info.getDailyData()
+        except callLimitExceeded:
+            print(callLimitExceeded)
+            info.sleep(300)
 
 
 
