@@ -90,46 +90,29 @@ class models:
                 test_data  = df['mid'].loc[df["recordDate"] > self.splitDate].as_matrix()
                 
                 scaler = MinMaxScaler()
-                train_data = train_data.reshape(-1,1)
-                test_data  = test_data.reshape(-1,1)
+                train_data = np.log(train_data.reshape(-1,1))
+                test_data  = np.log(test_data.reshape(-1,1))
                 
                 
-                smoothing_length = 90
-                slide_length = 30
-                for window in range(0, len(train_data)-1, slide_length):
-                    scaler.fit(train_data[window : window + smoothing_length  ,:])
-                    fitted_data = scaler.transform(train_data[window : window + smoothing_length  ,:])
-                    
-                    
-                    
-                
-                # You normalize the last bit of remaining data
-                scaler.fit(train_data[di+smoothing_window_size:,:])
-                train_data[di+smoothing_window_size:,:] = scaler.transform(train_data[di+smoothing_window_size:,:])
+                scaler.fit(train_data)
+                train_data = scaler.transform(train_data).reshape(-1)
+                test_data  = scaler.transform(test_data).reshape(-1)
                 
                 
-            
-
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
