@@ -10,11 +10,16 @@ import numpy as np
 import sqlite3
 import commonUtilities
 import matplotlib.pyplot as plt
-
-#import statsmodels.api as sm
-
-
 import warnings
+import random
+
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.arima_model import ARIMA
+from pmdarima.arima import auto_arima
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import math
+
 warnings.filterwarnings("ignore")
 
 
@@ -26,6 +31,7 @@ class missingTicker(Exception):
 class analysis:
     def __init__(self, dataBaseSaveFile = "./stockData.db"):
         self.DB = sqlite3.connect(dataBaseSaveFile)
+        self.mainDBName = dataBaseSaveFile
         self._cur = self.DB.cursor()
         self._tickerList = []   # Empty list that gets filled with a list of tickers to be considered
         self.tradingDateSet = []  # List of dates in YYYY-MM-DD format that are trading dates in the database
@@ -46,8 +52,8 @@ class analysis:
                               "MACD19":      "macd_19_39",
                               "OBV":         "on_bal_vol", 
                               "RSI":         "rsi",
-                              "BOLLINGER20": "bolinger_20",
-                              "BOLLINGER50": "bolinger_50"}
+                              "BOLLINGER20": "bollinger_20",
+                              "BOLLINGER50": "bollinger_50"}
     
     
     
@@ -373,18 +379,21 @@ class analysis:
     
     
     
-    def storeTriggers(self, OBVshift = 5, rsiLower = 30, rsiUpper = 70, indicators = [], tickerList = []):
+    def storeTriggers(self, OBVshift = 10, rsiLower = 30, rsiUpper = 70, multiplier = 2, indicators = [], tickerList = []):
         
         if indicators == []:
-            indicators = self.indicatorList.keys()
+            indicators = list(self.indicatorList.keys())
         if tickerList == []:
             tickerList = self._tickerList
             
         for ind in indicators:
             assert ind in self.indicatorList.keys(), "\nError, 'indicators' passed to 'storeTriggers()' not in 'indicatorList' key list."
         
+        tickNum = 0
+        
         for tick in tickerList:
-            print("\rProcessing ticker:  " + str(tick).rjust(6) + ".                                       ", end = "")
+            tickNum += 1
+            print("\rProcessing ticker:  " + str(tick).rjust(6) + ",     " + str(tickNum).rjust(6) + "  of  " + str(len(tickerList)) + ".                                       ", end = "")
             
             queryString = "SELECT * " +\
                           "FROM daily_adjusted \n" +\
@@ -416,12 +425,34 @@ class analysis:
                 if "bal_vol" in ind:
                     rslt_df[triggerColumn] = np.sign(rslt_df[ind] - rslt_df[ind].shift(periods = OBVshift, fill_value = 0))
                 if "rsi" in ind:
-                    temp = [1 if (x<rsiLower and y>rsiLower) else -1 if (x>rsiUpper and y<rsiUpper)
-                            else 0 for x,y in zip(rslt_df[ind][:-1],rslt_df[ind][1:])]
-                    temp.insert(0,0)
+                    temp = [1 if x>rsiUpper else -1 if x<rsiLower else 0 for x in rslt_df[ind]]
+                    temp = [1 if (x<rsiLower and y>rsiLower) 
+                            else -1 if (x>rsiUpper and y<rsiUpper)
+                            else  t for x,y,t 
+                            in zip(rslt_df[ind][:-1], rslt_df[ind][1:], temp)]
+                    temp.append(0)
                     rslt_df[triggerColumn] = temp
-                    rslt_df[triggerColumn] = rslt_df[triggerColumn].replace(0, method = "ffill")
-                                
+                    rslt_df[triggerColumn].replace(to_replace=0, method='ffill', inplace=True)
+                    
+                if "bollinger" in ind:
+                    helperCol = "tp" + ind.split("_")[1]
+                    
+                    upper = [tp + (b * multiplier) for tp, b in zip(rslt_df[helperCol], rslt_df[ind])]
+                    lower = [tp - (b * multiplier) for tp, b in zip(rslt_df[helperCol], rslt_df[ind])]
+                    
+                    trig  = [np.nan] * len(upper)
+                    prevClose = list(rslt_df["adj_close"][:-1])
+                    prevClose.insert(0,0)
+                    adjClose = rslt_df["adj_close"]
+                    
+                    trig = [ 1 if pc < l  and c > l  else tg for pc, c, l, tg in zip(prevClose, adjClose, lower, trig)]
+                    trig = [-1 if pc > u  and c < u  else tg for pc, c, u, tg in zip(prevClose, adjClose, upper, trig)]
+                    trig = [ 0 if (pc > tp and c < tp) or (pc < tp and c > tp) else tg for pc, c, tp, tg in zip (prevClose, adjClose, rslt_df[helperCol], trig)]
+                    
+                    rslt_df[triggerColumn] = trig
+                    rslt_df[triggerColumn].replace(to_replace = np.nan, method = "ffill", inplace = True)
+                    
+                    
                 # add each indicator trigger in the list of indicators to the 
                 # SQL query, along with the associated values.
                 sqlString += str(triggerColumn) + " = ?, \n     "
@@ -439,62 +470,98 @@ class analysis:
     
     
     
-    def plotIndicators(self, tickerList = [], indicators = []):
+    def plotIndicators(self, tickerList = [], indicators = [], tradeDelay = 1):
         print("\nProcessing plotting...")
         if indicators == []:
-            indicators = self.indicatorList.keys()
+            indicators = list(self.indicatorList.keys())
         if tickerList == []:
             tickerList = self._tickerList
         
-        loadedData, trigList = self.loadFromDB(tickerList = tickerList, indicators = indicators)
+        loadedData, trigList = self.loadFromDB(tickerList = tickerList, indicators = indicators, withTriggers = True)
+        
+        print()
+        
         
         for ind in indicators:
+            print("Indicator:  " + ind + "                                                             ")
             indColName = self.indicatorList[ind]
+            
             
             x_p = []
             x_n = []
             y_p = []
             y_n = []
+            gain = []
+            loss = []
+            return_p = []
+            return_n = []
+            triggerCount = 0
             
             
-            triggerLoc = list(np.where(np.diff(loadedData[indColName + "_trig"]))[0])
+            for ticker in tickerList:
+                print("\rParsing ticker:   " + ticker + "                                                                             ", end = "")
+                
+                tickerData = loadedData.loc[loadedData["ticker_symbol"] == ticker]
+                
+                triggerLoc = np.where(np.diff(tickerData[indColName + "_trig"]))[0]
+                
+                adjRat = [a / c for a, c in zip(tickerData["adj_close"], tickerData["close"])]
+                
+                tradePrice = [a * o for a, o in zip(adjRat, tickerData["open"])]
+                tradePrice = tradePrice[tradeDelay:]
+                tradePrice.append([tradePrice[-1] * tradeDelay])
+                
+                locRangeStart = min(tickerData.index)
+                for i in range(len(triggerLoc)-1):
+                    triggerCount += 1 
+                    
+                    if tickerData[indColName + "_trig"][triggerLoc[i] + 1 + locRangeStart] > 0.25:    # triggerLoc[i] + 1 in index due to function of np.diff in calculating the triggers
+                        y_p.append([p1 / tradePrice[triggerLoc[i]] for p1 in tradePrice[triggerLoc[i]:triggerLoc[i+1]]])
+                        x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] )))
+                        gain.append((1 / tradePrice[triggerLoc[i]], triggerLoc[i+1] - triggerLoc[i] ))
+                        
+                        
+                    elif tickerData[indColName + "_trig"][triggerLoc[i] + 1 + locRangeStart] < 0.25:    # triggerLoc[i] + 1 in index due to function of np.diff in calculating the triggers
+                        y_n.append([p1 / tradePrice[triggerLoc[i]] for p1 in tradePrice[triggerLoc[i]:triggerLoc[i+1]]])
+                        x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] )))
+                        loss.append((1 / tradePrice[triggerLoc[i]], triggerLoc[i+1] - triggerLoc[i] ))
+                        
+                        
+                for i in range(len(gain)):
+                    return_p.append(365 * ((y_p[i][-1] ** (1/(365*gain[i][1]/253)))  -1))
+                
+                for i in range(len(loss)):
+                    return_n.append(365 * ((y_n[i][-1] ** (1/(365*loss[i][1]/253)))  -1))
+                
             
-            for i in range(len(triggerLoc)-1):
-                if loadedData[indColName + "_trig"][triggerLoc[i]] > 0:
-                    y_p.append(list(loadedData["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/loadedData["tradePrice"][triggerLoc[i]]))
-                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-                else:
-                    y_n.append(list(loadedData["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/loadedData["tradePrice"][triggerLoc[i]]))
-                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
+            x_p = pd.Series([x+random.randrange(00, 49)/100 for seg in x_p for x in seg]) 
+            x_n = pd.Series([x+random.randrange(50, 99)/100 for seg in x_n for x in seg])  # Slide the loss positions to be between the gain positions on the plots; better shows envelope
             
+            y_p = pd.Series([100*(y-1) for seg in y_p for y in seg])  # Convert to percent changes
+            y_n = pd.Series([100*(y-1) for seg in y_n for y in seg])
             
-            x_p = pd.Series([x for seg in x_p for x in seg])
-            x_n = pd.Series([x for seg in x_n for x in seg])
-            
-            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
-            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
-            
-            plt.figure()
-            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
-            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
+            plt.figure(dpi = 1000)
+            plt.scatter(x_p, y_p, marker = ".", s = min( 5000/len(tickerList), 3), c = "#00cc00", label = "buy",  linewidths = 0, alpha = 1.000)
+            plt.scatter(x_n, y_n, marker = ".", s = min(10000/len(tickerList), 3), c = "#ff0000", label = "sell", linewidths = 0, alpha = 0.125)
             plt.title("Scatter Plot of time vs returns " + ind)
-            plt.legend()
+            plt.legend(markerscale = 10)
             
             
-            avgNeg = y_n.mean()
-            avgPos = y_p.mean()
-            avgLen = len(loadedData)/len(triggerLoc)
+            avgPos = sum(return_p) / len(return_p)
+            avgNeg = sum(return_n) / len(return_n)
+            avgLen = len(loadedData)/triggerCount
             
-            print("average " + ind + " positive return:   " + str(avgPos))
-            print("average " + ind + " negative return:   " + str(avgNeg))
-            print("average " + ind + " timeframe:         " + str(avgLen))
-            print()
+            print("\r                                                                                 ")
+            print("average " + ind + " positive return:   " + str(avgPos*100)[:5] + "% per year.")
+            print("average " + ind + " negative return:   " + str(avgNeg*100)[:5] + "% per year.")
+            print("average " + ind + " timeframe:         " + str(avgLen)[:5]     + " days between trades.")
+            print("\n")
             
-        
-        
+        return loadedData
     
     
-    def loadFromDB(self, tickerList = [], indicators = []):
+    
+    def loadFromDB(self, tickerList = [], indicators = [], withTriggers = False):
         self.validate.validateListString(tickerList)
         self.validate.validateListString(indicators)
         for value in indicators:
@@ -504,11 +571,13 @@ class analysis:
         results = pd.DataFrame()
         trigList = []
         
+        print()
+        
         for tick in tickerList:
-            print("\rRetrieving ticker:  " + str(tick).rjust(6) + "  and indicators:  " + str(indicators) + ".             ", end = "")
+            print("\rRetrieving ticker:  '" + str(tick).ljust(6) + "'  with indicators:  " + str(indicators) + ".             ", end = "")
             argList = []
             argList.append(tick)
-            queryString = "SELECT [INDICATORS] adj_close, ticker_symbol " +\
+            queryString = "SELECT [INDICATORS] adj_close, close, open, ticker_symbol, recordDate " +\
                           "FROM daily_adjusted \n" +\
                           "WHERE ticker_symbol = ?;"
             
@@ -517,6 +586,8 @@ class analysis:
             indicatorString = ""
             for ind in indicators:
                 indicatorString += self.indicatorList[ind] + ", "
+                if withTriggers:
+                    indicatorString += self.indicatorList[ind] + "_trig, "
             
             queryString = queryString.replace("[INDICATORS]", indicatorString)
             
@@ -528,20 +599,120 @@ class analysis:
         
         trigList.pop()
         
+        print()
         return results, trigList
-
-
+    
+    
+    
+    def copyTimeSeriesToNewDatabase(self, newDBName, tableName = "daily_adjusted", delCurrentTable = True):
+        if self._tickerList == []:
+            raise ValueError("Selected Ticker List is empty.  Run 'filterStocksFromDataBase()' to add tickers to the list.")
+        if newDBName == "" or not isinstance(newDBName, str) or newDBName == self.mainDBName:
+            raise ValueError("Database Name is not valid.")
+        
+        
+        # get the schema from the existing table of time series data
+        # https://www.sqlitetutorial.net/sqlite-describe-table/
+        schemaText = self._cur.execute("""SELECT sql 
+                                          FROM sqlite_schema 
+                                          WHERE name = 'daily_adjusted';""").fetchall()
+        schemaText = schemaText[0][0] # convert the returned tuple to an executable SQL string command
+        schemaText = schemaText[schemaText.find('('):]
+        
+        
+        # create a new database and add a copy of the time series table schema
+        self._cur.execute("ATTACH DATABASE ? AS newDB;", [newDBName])
+        if delCurrentTable:
+            self._cur.execute("DROP TABLE IF EXISTS newDB.daily_adjusted;")
+        self._cur.execute("CREATE TABLE newDB.daily_adjusted" + schemaText + ";")
+        
+        n = 0
+        for ticker in self._tickerList:
+            n += 1
+            print("\rCopying ticker:  " + ticker.rjust(6) + "   (" + str(n).rjust(5) + " of " + str(len(self._tickerList)).ljust(6) + ").", end = "")
+            self._cur.execute("""INSERT INTO newDB.daily_adjusted 
+                                 SELECT * FROM main.daily_adjusted
+                                 WHERE ticker_symbol = ?;""", [ticker])
+        
+        self.DB.commit()
+        self._cur.execute("DETACH DATABASE newDB;")
+        print("\nComplete.")
+        return
+    
+    
+    
+    def copyTimeSeriesToCSV(self, newDBName):
+        if self._tickerList == []:
+            raise ValueError("Selected Ticker List is empty.  Run 'filterStocksFromDataBase()' to add tickers to the list.")
+        if newDBName == "" or not isinstance(newDBName, str) or newDBName == self.mainDBName:
+            raise ValueError("Database Name is not valid.")
+        
+        
+        loadedData, trigList = self.loadFromDB(tickerList = self._tickerList, indicators = list(self.indicatorList.keys()), withTriggers = True)
+        loadedData.sort_values(by = ["ticker_symbol", "recordDate"], ascending=True, inplace=True)
+        
+        
+        loadedData.to_csv(path_or_buf = newDBName)
+        
+        print("\nComplete.")
+        return        
+    
+    
+    
+    
+    def ARIMA(self, tickerList = [], indicators = []):
+        
+        if indicators == []:
+            indicators = list(self.indicatorList.keys())
+        if tickerList == []:
+            tickerList = self._tickerList
+        
+        loadedData, trigList = self.loadFromDB(tickerList = tickerList, indicators = indicators, withTriggers = True)
+        
+        
+        loadedData['recordDate'] = pd.to_datetime(loadedData['recordDate'])
+        loadedData = loadedData.set_index("recordDate")
+        df_close = loadedData["adj_close"]
+        
+        
+        result = seasonal_decompose(df_close, model='multiplicative', period = 30)
+        
+        fig = plt.figure()  
+        fig = result.plot()  
+        fig.set_size_inches(16, 9)
+        
+        #if not stationary then eliminate trend
+        #Eliminate trend
+        
+        # from pylab import rcParams
+        # rcParams['figure.figsize'] = 10, 6
+        # df_log = np.log(loadedData["adj_close"])
+        # moving_avg = df_log.rolling(12).mean()
+        # std_dev = df_log.rolling(12).std()
+        # plt.legend(loc='best')
+        # plt.title('Moving Average')
+        # plt.plot(std_dev, color ="black", label = "Standard Deviation")
+        # plt.plot(moving_avg, color="red", label = "Mean")
+        # plt.legend()
+        # plt.show()
+            
 
 
 
 
 if __name__ == "__main__":
     ana = analysis()
-    ana.filterStocksFromDataBase(dailyLength = 1250, maxDailyChange = 100, minDailyChange = -80, minDailyVolume = 1000)
+    ana.filterStocksFromDataBase(dailyLength = 1250, 
+                                 maxDailyChange = 50, 
+                                 minDailyChange = -50, 
+                                 minDailyVolume = 50000)
+    
     print("Number of stocks selected:  " + str(len(ana._tickerList)) + ".             ")
     
-    ana.storeTriggers(tickerList = ana._tickerList)
-    ana.plotIndicators(tickerList = ana._tickerList)
+    # new = ana.storeTriggers(tickerList = ana._tickerList)
+    # data = ana.plotIndicators(tickerList = ana._tickerList)
+    # ana.ARIMA(tickerList = ana._tickerList)
+    ana.copyTimeSeriesToCSV("copyOfDB.csv")
     
     
     

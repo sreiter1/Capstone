@@ -17,10 +17,7 @@ import requests
 import sqlite3
 import os
 import sys
-import psutil
 import commonUtilities
-
-
 
 
 class callLimitExceeded(Exception):
@@ -33,9 +30,6 @@ class vpnResetFailed(Exception):
     # Occurs if the VPN reset function fails.  This is likely to be triggered
     # after the API call limit is exceeded if the VPN cannot be reset.
     pass
-
-
-
 
 
 class getAlphaVantageData:
@@ -66,7 +60,7 @@ class getAlphaVantageData:
                                       "NUMRECORDS"  :  "records_"}
         
         self.validate = commonUtilities.validationFunctions()
-        self.tools = processTools
+        self.vpnTools = commonUtilities.VPNProcessTools()
     
     
     
@@ -353,7 +347,7 @@ class getAlphaVantageData:
         data = response.json()
         
         # Check the response for errors
-        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "time"):
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "alphatime"):
             return None
         
         # Extract the data from the response and convert it to a dataframe
@@ -374,7 +368,7 @@ class getAlphaVantageData:
         
         # optionally save the data to the SQLite database
         if save:
-            self.saveToSQL(stockDF, "time", ticker_symbol)
+            self.saveToSQL(stockDF, "alphatime", ticker_symbol)
         
         # return the downloaded data back from the function
         return stockDF
@@ -1007,7 +1001,7 @@ class getAlphaVantageData:
         # default metrics to be all of the metrics; otherwise call the specific
         # functions for the data requested.
         if metrics == None:
-            metrics = ["time", "balance", "cash", "earnings", "overview", "income"]
+            metrics = ["alphatime", "balance", "cash", "earnings", "overview", "income"]
             
         
         # Need a starting point for building the SQL query string
@@ -1113,7 +1107,7 @@ class getAlphaVantageData:
         # returned from the SQL query.  
         for stock in resultList:
             for metric in resultsDict[stock]:
-                if metric == "time":
+                if metric == "alphatime":
                     self._getTimeSeriesDaily(stock)
                 elif metric == "balance":
                     self._getBalanceSheet(stock)
@@ -1440,115 +1434,6 @@ class getYahooData:
         print()
 
 
-class processTools:
-    
-    def _checkIfProcessRunning(self, processName):
-        # Check if there is any running process that contains the given name 
-        # processName.  
-        
-        #Iterate over the all the running process
-        for proc in psutil.process_iter():
-            try:
-                # Check if process name contains the given name string.
-                if processName.lower() in proc.name().lower():
-                    return proc
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-        return False;
-    
-    
-    
-    def resetVPN(self):
-        print("\n\n   Stopping VPN...")
-        process = self.tools._checkIfProcessRunning("nsv")  # look for the Norton VPN service
-        while process != False: # keep looking until the service is found
-            vpnKillStatus = os.system("schtasks /run /tn killVPN")
-            # stops the norton vpn I am using. The command line needs
-            # run "taskkill /f /im NSV.exe" as an administrator.  This 
-            # command is contained in a batch file that is then added to
-            # to the windows scheduler as an "on demand" task.  This task
-            # is then executed via the line above to avoid the need for
-            # the user (i.e. me) to provide permission for the batch file
-            # to run.  The output is assigned to 'vpnKillStatus', which 
-            # is 0 if completed successfully and 1 otherwise.
-            
-            if vpnKillStatus == 1:
-                raise vpnResetFailed("\nScheduled Task failed to complete successfully.\n")
-            
-            # This opens a security vulnerability if the batch file is altered.
-            time.sleep(3) # helps to keep from confusing the VPN.  3 was pulled from thin air.
-            process = self.tools._checkIfProcessRunning("nsv") # look for the Norton VPN service
-        
-        
-        print("   Restarting VPN...")
-        while process == False:  # if the Norton VPN process doeesn't exist (not runninng), 'process' will be false
-            # Call the OS to start Norton VPN.  The VPN is setup to automatically connect to the servers.
-            os.system('"C:\\Program Files\\NortonSecureVPN\\Engine\\5.1.1.5\\nsvUIStub.exe"')
-            time.sleep(5)
-            process = self.tools._checkIfProcessRunning("nsv")
-        
-        print("   Resetting API call counter...")
-        # reset the API calls and call times.
-        self._resetTotalApiCalls()
-        apiCallTime = time.time() - 60
-        self._apiRecentCallTimes = [apiCallTime for i in range(self._rate)]
-        print("   API call counter reset.")
-        print("   VPN restart complete.\n\n")
-        
-        return 0    
-    
-    
-    
-    def loadStockListCSV(self, stockListFileName, saveToDB = True):
-        # reads a csv file of stock tickers and optionally saves them to 
-        # 'ticker_symbol_list' table in the database.
-        try:
-            # Open the csv-based list of tickers/companies
-            stockFile = open(stockListFileName, "r") 
-            
-        except:
-            print("Bad stock list file.  Unable to open.")
-            return 1
-        
-        # read each line and create a list for the outputs
-        Lines = stockFile.readlines()
-        
-        DF_ticker = [] # ticker symbol list
-        DF_name = [] # name of the company
-        DF_exchange = [] # exchange that the stock is traded on
-        DF_recordDate = [] # date that the ticker was added to the database
-        
-        # open each line, split on the comma to get each value, append the 
-        # ticker, name, and exchange from the CSV to the lists, and add today's
-        # date to the record date.  
-        for line in Lines:
-            stock = line.split(",")
-            DF_ticker.append(stock[0])
-            DF_name.append(stock[1])
-            DF_exchange.append(stock[2].strip('\n'))
-            DF_recordDate.append(datetime.date.today())
-            
-            # execute a save to the 'ticker_symbol_list' table.
-            if saveToDB:
-                self._updateTickerList(ticker_symbol = stock[0],
-                                       name = stock[1],
-                                       exchange = stock[2].strip("\n"),
-                                       recordDate = str(datetime.date.today()))
-            
-        # create the dataframe with all the recorded data
-        df = pd.DataFrame([DF_ticker,
-                           DF_recordDate,
-                           DF_name,
-                           DF_exchange])
-        
-        # label the data
-        df.index = ["ticker_symbol", "recordDate", "name", "exchange"]
-        df = df.transpose()
-        
-        # return the data
-        return df
-    
-
 
 
 class database:
@@ -1662,33 +1547,45 @@ class database:
         
                 
         cur.execute('''CREATE TABLE daily_adjusted (
-                        id               INTEGER     PRIMARY KEY     AUTOINCREMENT,
-                        ticker_symbol    TEXT,
-                        recordDate       TEXT,
-                        open             REAL,
-                        high             REAL,
-                        low              REAL,
-                        close            REAL,
-                        adj_close        REAL,
-                        volume           REAL,
-                        dividend         REAL,
-                        split            REAL,
-                        adjustment_ratio REAL,
-                        mvng_avg_20      REAL,
-                        mvng_avg_50      REAL,
-                        macd_12_26       REAL,
-                        macd_19_39       REAL,
-                        vol_avg_20       REAL,
-                        vol_avg_50       REAL,
-                        on_bal_vol       REAL,
-                        percent_cng_day  REAL,
-                        percent_cng_tot  REAL,
-                        rsi              REAL,
+                        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticker_symbol     TEXT,
+                        recordDate        TEXT,
+                        open              REAL,
+                        high              REAL,
+                        low               REAL,
+                        close             REAL,
+                        adj_close         REAL,
+                        volume            REAL,
+                        vol_avg_20        REAL,
+                        vol_avg_50        REAL,
+                        dividend          REAL,
+                        split             REAL,
+                        adjustment_ratio  REAL,
+                        percent_cng_day   REAL,
+                        percent_cng_tot   REAL,
+                        mvng_avg_20       REAL,
+                        tp20              REAL,
+                        bollinger_20      REAL,
+                        mvng_avg_20_trig  INTEGER,
+                        bollinger_20_trig REAL,
+                        mvng_avg_50       REAL,
+                        tp50              REAL,
+                        bollinger_50      REAL,
+                        mvng_avg_50_trig  INTEGER,
+                        bollinger_50_trig REAL,
+                        macd_12_26        REAL,
+                        macd_12_26_trig   INTEGER,
+                        macd_19_39        REAL,
+                        macd_19_39_trig   INTEGER,
+                        on_bal_vol        REAL,
+                        on_bal_vol_trig   INTEGER,
+                        rsi               REAL,
+                        rsi_trig          INTEGER,
                         CONSTRAINT ticker_date_constraint UNIQUE (
                             ticker_symbol ASC,
                             recordDate
                         )
-                        ON CONFLICT IGNORE);  ''')
+                        ON CONFLICT IGNORE); ''')
 
         
         
@@ -1859,31 +1756,33 @@ class database:
         
         
         cur.execute('''CREATE TABLE ticker_symbol_list (
-                        id                           INTEGER     PRIMARY KEY     AUTOINCREMENT,
-                        ticker_symbol                TEXT        NOT NULL,
-                        recordDate                   TEXT        NOT NULL,
+                        id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ticker_symbol                TEXT    NOT NULL,
+                        recordDate                   TEXT    NOT NULL,
                         name                         TEXT,
                         exchange                     TEXT,
-                        error_fundamental_overview   INTEGER DEFAULT -1      NOT NULL,
-                        error_income_statement       INTEGER DEFAULT -1      NOT NULL,
-                        error_earnings               INTEGER DEFAULT -1      NOT NULL,
-                        error_daily_adjusted         INTEGER DEFAULT -1      NOT NULL,
-                        error_balance_sheet          INTEGER DEFAULT -1      NOT NULL,
-                        error_cash_flow              INTEGER DEFAULT -1      NOT NULL,
+                        error_fundamental_overview   INTEGER DEFAULT -1     NOT NULL,
+                        error_income_statement       INTEGER DEFAULT -1     NOT NULL,
+                        error_earnings               INTEGER DEFAULT -1     NOT NULL,
+                        error_alpha_daily            INTEGER DEFAULT -1     NOT NULL,
+                        error_balance_sheet          INTEGER DEFAULT -1     NOT NULL,
+                        error_cash_flow              INTEGER DEFAULT -1     NOT NULL,
                         date_fundamental_overview    TEXT,
                         date_income_statement        TEXT,
                         date_earnings                TEXT,
-                        date_daily_adjusted          TEXT,
+                        date_alpha_daily             TEXT,
                         date_balance_sheet           TEXT,
                         date_cash_flow               TEXT,
                         records_fundamental_overview INTEGER,
                         records_income_statement     INTEGER,
                         records_earnings             INTEGER,
-                        records_daily_adjusted       INTEGER,
+                        records_alpha_daily          INTEGER,
                         records_balance_sheet        INTEGER,
                         records_cash_flow            INTEGER,
-                        CONSTRAINT ticker_constraint UNIQUE (ticker_symbol ASC)
-                        ON CONFLICT IGNORE ); ''')
+                        CONSTRAINT ticker_constraint UNIQUE (
+                            ticker_symbol ASC
+                        )
+                        ON CONFLICT IGNORE);  ''')
         
         
         
@@ -1918,19 +1817,20 @@ class database:
 
 
 if __name__ == "__main__":
-    # t_start = time.time()
+    t_start = time.time()
     
-    # info = getAlphaVantageData()
+    info = getAlphaVantageData()
     
-    # info.confirmDatesAndCounts()
+    info.confirmDatesAndCounts()
     
-    # info.tools.resetVPN()
+    # info.vpnTools.resetVPN()
     
-    # complete = 1
+    
+    # complete = info.autoUpdate(missing = False)
     
     # while(complete != 0):
     #     try:
-    #         complete = info.autoUpdate(stockList=["ERAO"])
+    #         complete = info.autoUpdate()
     #     except callLimitExceeded:
     #         pass
     #         # info.tools.resetVPN()
@@ -1938,16 +1838,16 @@ if __name__ == "__main__":
     # t_1 = time.time()
 
 
-    info = getYahooData()
+    # info = getYahooData()
     
-    notDone = True
+    # notDone = True
     
-    while notDone:
-        try:
-            notDone = info.getDailyData()
-        except callLimitExceeded:
-            print(callLimitExceeded)
-            info.sleep(300)
+    # while notDone:
+    #     try:
+    #         notDone = info.getDailyData()
+    #     except callLimitExceeded:
+    #         print(callLimitExceeded)
+    #         info.sleep(300)
 
 
 

@@ -25,6 +25,7 @@ class missingTicker(Exception):
 
 class analysis:
     def __init__(self, dataBaseSaveFile = "./stockData.db"):
+        self.mainDBName = dataBaseSaveFile
         self.DB = sqlite3.connect(dataBaseSaveFile)
         self._cur = self.DB.cursor()
         self._tickerList = []   # Empty list that gets filled with a list of tickers to be considered
@@ -40,17 +41,22 @@ class analysis:
         # prevent database corruption.
         self._dailyConversionTable = commonUtilities.conversionTables.dailyConversionTable
         
-        self.indicatorList = {"ADJRATIO":    "adjustment_ratio",
-                              "MA20":        "mvng_avg_20", 
-                              "MA50":        "mvng_avg_50", 
-                              "MACD12":      "macd_12_26", 
-                              "MACD19":      "macd_19_39",
-                              "VOL20":       "vol_avg_20",
-                              "VOL50":       "vol_avg_50",
-                              "OBV":         "on_bal_vol", 
-                              "DAYCHANGE":   "percent_cng_day", 
-                              "TOTALCHANGE": "percent_cng_tot", 
-                              "RSI":         "rsi"}
+        self.indicatorList = {"ADJRATIO"     : "adjustment_ratio",
+                              "MA20"         : "mvng_avg_20", 
+                              "MA50"         : "mvng_avg_50", 
+                              "BOLLINGER20"  : "bollinger_20",
+                              "TP20"         : "tp20",
+                              "BOLLINGER50"  : "bollinger_50",
+                              "TP50"         : "tp50",
+                              "MACD12"       : "macd_12_26", 
+                              "MACD19"       : "macd_19_39",
+                              "VOL20"        : "vol_avg_20",
+                              "VOL50"        : "vol_avg_50",
+                              "OBV"          : "on_bal_vol", 
+                              "DAYCHANGE"    : "percent_cng_day", 
+                              "TOTALCHANGE"  : "percent_cng_tot", 
+                              "RSI"          : "rsi"}
+        
     
     
     def dailyReturns(self,
@@ -510,7 +516,6 @@ class analysis:
     
     
     
-    
     def coor_MA(self, tickerList = [], tradeDelay = 0):
         indics = ["MA20", "MA50"]
         loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, indicators = indics)
@@ -539,6 +544,95 @@ class analysis:
             
             print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
             triggerLoc = list(np.where(np.diff(np.sign(results[indColName + "_trig"])))[0])
+            
+            for i in range(len(triggerLoc)-1):
+                if results[indColName + "_trig"][triggerLoc[i]] > 0:
+                    y_p.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
+                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
+                else:
+                    y_n.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
+                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
+            
+            
+            x_p = pd.Series([x for seg in x_p for x in seg])
+            x_n = pd.Series([x for seg in x_n for x in seg])
+            
+            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
+            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
+            
+            plt.figure()
+            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
+            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
+            plt.title("Scatter Plot of time vs returns " + ind)
+            plt.legend()
+            
+            
+            avgNeg = y_n.mean()
+            avgPos = y_p.mean()
+            avgLen = len(results)/len(triggerLoc)
+            
+            print("average " + ind + " positive return:   " + str(avgPos))
+            print("average " + ind + " negative return:   " + str(avgNeg))
+            print("average " + ind + " timeframe:         " + str(avgLen))
+            print()
+            
+        return results, triggerLoc
+    
+    
+    
+    def coor_BOLL(self, tickerList = [], tradeDelay = 0):
+        # need the TP for Bollinger Band Calcs
+        indics = {"BOLLINGER20": "TP20", 
+                  "BOLLINGER50": "TP50"}
+        loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, 
+                                                        indicators = list(indics.keys()) + list(indics.values()))
+        
+        loadedData["tradePrice"] = None
+        
+        for ind in indics.keys():
+            loadedData[self.indicatorList[ind] + "_trig"] = None
+        
+        for ind in indics.keys():
+            indColName  = self.indicatorList[ind]
+            helpColName = self.indicatorList[indics[ind]]
+            results = pd.DataFrame(columns = loadedData.columns)
+            
+            x_p = []
+            x_n = []
+            y_p = []
+            y_n = []
+            
+            for tick in tickerList:
+                print("\rProcessing ticker:  " + str(tick).rjust(6) + "  for " + ind + ".                                                            ", end = "")
+                rslt_df = loadedData.loc[loadedData["ticker_symbol"] == tick]
+                
+                upper = [tp + b for tp, b in zip(rslt_df[helpColName], rslt_df[indColName])]
+                lower = [tp - b for tp, b in zip(rslt_df[helpColName], rslt_df[indColName])]
+                trig  = [0] * len(upper)
+                delta = list(np.sign([t2 - t1 for t2, t1 in zip(rslt_df[helpColName][1:], rslt_df[helpColName][:-1])]))
+                delta.append(0)
+                lstlen=len(delta)
+                trend = np.sign([sum(delta[max(i-20, 0):i]) for i in range(lstlen)])
+                
+                trig = [-1 if c > u and tr < 0 else tg for c, u, tr, tg in zip(rslt_df["adj_close"], upper, trend, trig)]
+                trig = [ 1 if c < l and tr > 0 else tg for c, l, tr, tg in zip(rslt_df["adj_close"], lower, trend, trig)]
+                
+                rslt_df[indColName + "_trig"] = trig
+                rslt_df["tradePrice"] = rslt_df["adj_close"].shift(periods = tradeDelay)
+                
+                results = pd.concat([results, rslt_df])
+            
+            
+            print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
+            triggerLoc = [i for i, e in enumerate(results[indColName + "_trig"]) if e != 0]
+            # triggerLoc = []
+            
+            # return loc, results[indColName + "_trig"], upper
+            
+            # for i in range(1,len(loc)):
+            #     if results[indColName + "_trig"][loc[i]] != results[indColName + "_trig"][loc[i-1]]:
+            #         triggerLoc.append(loc[i])
+                    
             
             for i in range(len(triggerLoc)-1):
                 if results[indColName + "_trig"][triggerLoc[i]] > 0:
@@ -745,7 +839,44 @@ class analysis:
         trigList.pop()
         
         return results, trigList
-
+    
+    
+    
+    def copyTimeSeriesToNewDatabase(self, newDBName, tableName = "daily_adjusted", delCurrentTable = True):
+        if self._tickerList == []:
+            raise ValueError("Selected Ticker List is empty.  Run 'filterStocksFromDataBase()' to add tickers to the list.")
+        if newDBName == "" or not isinstance(newDBName, str) or newDBName == self.mainDBName:
+            raise ValueError("Database Name is not valid.")
+        
+        
+        # get the schema from the existing table of time series data
+        # https://www.sqlitetutorial.net/sqlite-describe-table/
+        schemaText = self._cur.execute("""SELECT sql 
+                                          FROM sqlite_schema 
+                                          WHERE name = 'daily_adjusted';""").fetchall()
+        schemaText = schemaText[0][0] # convert the returned tuple to an executable SQL string command
+        schemaText = schemaText[schemaText.find('('):]
+        
+        
+        # create a new database and add a copy of the time series table schema
+        self._cur.execute("ATTACH DATABASE ? AS newDB;", [newDBName])
+        if delCurrentTable:
+            self._cur.execute("DROP TABLE IF EXISTS newDB.daily_adjusted;")
+        self._cur.execute("CREATE TABLE newDB.daily_adjusted" + schemaText + ";")
+        
+        n = 0
+        for ticker in self._tickerList:
+            n += 1
+            print("\rCopying ticker:  " + ticker.rjust(6) + "   (" + str(n).rjust(5) + " of " + str(len(self._tickerList)).ljust(6) + ").", end = "")
+            self._cur.execute("""INSERT INTO newDB.daily_adjusted 
+                                 SELECT * FROM main.daily_adjusted
+                                 WHERE ticker_symbol = ?;""", [ticker])
+        
+        self.DB.commit()
+        self._cur.execute("DETACH DATABASE newDB;")
+        print("\nComplete.")
+        return
+        
 
 
 
@@ -757,13 +888,18 @@ if __name__ == "__main__":
     # decomposition.seasonal.plot();
     
     ana = analysis()
-    ana.filterStocksFromDataBase(dailyLength = 1250, maxDailyChange = 100, minDailyChange = -80, minDailyVolume = 1000)
+    ana.filterStocksFromDataBase(dailyLength = 1250, maxDailyChange = 100, minDailyChange = -80, minDailyVolume = 500000)
     print("Number of stocks selected:  " + str(len(ana._tickerList)) + ".             ")
     
-    ana.coor_MACD(tickerList = ana._tickerList)
-    ana.coor_MA(tickerList   = ana._tickerList)
-    ana.coor_OBV(tickerList  = ana._tickerList)
-    ana.coor_RSI(tickerList  = ana._tickerList)
+    
+    #ana.coor_MACD(tickerList = ana._tickerList)
+    ana.coor_BOLL(tickerList = ana._tickerList)
+    #ana.coor_MA(tickerList   = ana._tickerList)
+    #ana.coor_OBV(tickerList  = ana._tickerList)
+    #ana.coor_RSI(tickerList  = ana._tickerList)
+    
+    
+    #ana.copyTimeSeriesToNewDatabase(newDBName = "./DBcopy.db")
     
     
     # vol_diff = [[],[],[]]

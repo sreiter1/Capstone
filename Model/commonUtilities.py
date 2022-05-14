@@ -7,16 +7,20 @@ Created on Sun Feb 13 08:14:11 2022
 
 
 import datetime
+import psutil
+import os
+import pandas as pd
+import time
 
 
 
 class conversionTables:
-    tickerConversionTable =  {"time"     : "daily_adjusted",
-                              "balance"  : "balance_sheet",
-                              "cash"     : "cash_flow",
-                              "earnings" : "earnings",
-                              "overview" : "fundamental_overview",
-                              "income"   : "income_statement"}
+    tickerConversionTable =  {"alphatime"   : "alpha_daily",
+                              "balance"      : "balance_sheet",
+                              "cash"         : "cash_flow",
+                              "earnings"     : "earnings",
+                              "overview"     : "fundamental_overview",
+                              "income"       : "income_statement"}
         
     # Converts user unput to the columns in the table.  Provides a filter to 
     # prevent database corruption.
@@ -31,7 +35,9 @@ class conversionTables:
                              "MA20"         : "mvng_avg_20",
                              "MA50"         : "mvng_avg_50",
                              "BOLLINGER20"  : "bollinger_20",
+                             "TP20"         : "tp20",
                              "BOLLINGER50"  : "bollinger_50",
+                             "TP50"         : "tp50",
                              "MACD12"       : "macd_12_26",
                              "MACD19"       : "macd_19_39",
                              "VOL20"        : "vol_avg_20",
@@ -40,6 +46,55 @@ class conversionTables:
                              "DAYCHANGE"    : "percent_cng_day",
                              "TOTALCHANGE"  : "percent_cng_tot",
                              "RSI"          : "rsi"}
+    
+    def loadStockListCSV(self, stockListFileName, saveToDB = True):
+        # reads a csv file of stock tickers and optionally saves them to 
+        # 'ticker_symbol_list' table in the database.
+        try:
+            # Open the csv-based list of tickers/companies
+            stockFile = open(stockListFileName, "r") 
+            
+        except:
+            print("Bad stock list file.  Unable to open.")
+            return 1
+        
+        # read each line and create a list for the outputs
+        Lines = stockFile.readlines()
+        
+        DF_ticker = [] # ticker symbol list
+        DF_name = [] # name of the company
+        DF_exchange = [] # exchange that the stock is traded on
+        DF_recordDate = [] # date that the ticker was added to the database
+        
+        # open each line, split on the comma to get each value, append the 
+        # ticker, name, and exchange from the CSV to the lists, and add today's
+        # date to the record date.  
+        for line in Lines:
+            stock = line.split(",")
+            DF_ticker.append(stock[0])
+            DF_name.append(stock[1])
+            DF_exchange.append(stock[2].strip('\n'))
+            DF_recordDate.append(datetime.date.today())
+            
+            # execute a save to the 'ticker_symbol_list' table.
+            if saveToDB:
+                self._updateTickerList(ticker_symbol = stock[0],
+                                       name = stock[1],
+                                       exchange = stock[2].strip("\n"),
+                                       recordDate = str(datetime.date.today()))
+            
+        # create the dataframe with all the recorded data
+        df = pd.DataFrame([DF_ticker,
+                           DF_recordDate,
+                           DF_name,
+                           DF_exchange])
+        
+        # label the data
+        df.index = ["ticker_symbol", "recordDate", "name", "exchange"]
+        df = df.transpose()
+        
+        # return the data
+        return df
     
 
 
@@ -118,4 +173,80 @@ class validationFunctions:
             return 1
             
             
+
+
+
+class callLimitExceeded(Exception):
+    # raised when the program detects that the call limit was exceeded, 
+    # either because the limit set in 'getData' is exceeded or if the API 
+    # returns a specific error.
+    pass
+
+class vpnResetFailed(Exception):
+    # Occurs if the VPN reset function fails.  This is likely to be triggered
+    # after the API call limit is exceeded if the VPN cannot be reset.
+    pass
+
+
+
+class VPNProcessTools:
+    
+    def _checkIfProcessRunning(self, processName):
+        # Check if there is any running process that contains the given name 
+        # processName.  
+        
+        #Iterate over the all the running process
+        for proc in psutil.process_iter():
+            try:
+                # Check if process name contains the given name string.
+                if processName.lower() in proc.name().lower():
+                    return proc
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        return False;
+    
+    
+    
+    def resetVPN(self):
+        print("\n\n   Stopping VPN...")
+        process = self._checkIfProcessRunning("nsv")  # look for the Norton VPN service
+        while process != False: # keep looking until the service is found
+            vpnKillStatus = os.system("schtasks /run /tn killVPN")
+            # stops the norton vpn I am using. The command line needs
+            # run "taskkill /f /im NSV.exe" as an administrator.  This 
+            # command is contained in a batch file that is then added to
+            # to the windows scheduler as an "on demand" task.  This task
+            # is then executed via the line above to avoid the need for
+            # the user (i.e. me) to provide permission for the batch file
+            # to run.  The output is assigned to 'vpnKillStatus', which 
+            # is 0 if completed successfully and 1 otherwise.
             
+            if vpnKillStatus == 1:
+                raise vpnResetFailed("\nScheduled Task failed to complete successfully.\n")
+            
+            # This opens a security vulnerability if the batch file is altered.
+            time.sleep(3) # helps to keep from confusing the VPN.  3 was pulled from thin air.
+            process = self.tools._checkIfProcessRunning("nsv") # look for the Norton VPN service
+        
+        
+        print("   Restarting VPN...")
+        while process == False:  # if the Norton VPN process doeesn't exist (not runninng), 'process' will be false
+            # Call the OS to start Norton VPN.  The VPN is setup to automatically connect to the servers.
+            os.system("C:\\Program Files\\NortonSecureVPN\\Engine\\5.1.1.5\\nsvUIStub.exe")
+            time.sleep(5)
+            process = self._checkIfProcessRunning("nsv")
+        
+        print("   Resetting API call counter...")
+        # reset the API calls and call times.
+        self._resetTotalApiCalls()
+        apiCallTime = time.time() - 60
+        self._apiRecentCallTimes = [apiCallTime for i in range(self._rate)]
+        print("   API call counter reset.")
+        print("   VPN restart complete.\n\n")
+        
+        return 0    
+    
+    
+    
+
+    

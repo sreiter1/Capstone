@@ -91,21 +91,21 @@ class filterData:
                 returnWhat.append("error_fundamental_overview")
                 returnWhat.append("error_income_statement")
                 returnWhat.append("error_earnings")
-                returnWhat.append("error_daily_adjusted")
+                returnWhat.append("error_alpha_daily")
                 returnWhat.append("error_balance_sheet")
                 returnWhat.append("error_cash_flow")
             if returnDate:
                 returnWhat.append("date_fundamental_overview")
                 returnWhat.append("date_income_statement")
                 returnWhat.append("date_earnings")
-                returnWhat.append("date_daily_adjusted")
+                returnWhat.append("date_alpha_daily")
                 returnWhat.append("date_balance_sheet")
                 returnWhat.append("date_cash_flow")
             if returnNumRecord:
                 returnWhat.append("records_fundamental_overview")
                 returnWhat.append("records_income_statement")
                 returnWhat.append("records_earnings")
-                returnWhat.append("records_daily_adjusted")
+                returnWhat.append("records_alpha_daily")
                 returnWhat.append("records_balance_sheet")
                 returnWhat.append("records_cash_flow")
             
@@ -122,7 +122,7 @@ class filterData:
             # execute the SQL query and convert the response to a pandas dataframe
             query = self._cur.execute(queryString, argList)
             cols = [column[0] for column in query.description]
-            results = results.append(pd.DataFrame.from_records(data = query.fetchall(), columns = cols))
+            results = pd.concat([results, pd.DataFrame.from_records(data = query.fetchall(), columns = cols)], axis=0)
         
         # make the list of tickers in the dataframe available outside the funciton
         self._tickerList = results["ticker_symbol"].tolist()
@@ -150,7 +150,7 @@ class filterData:
         if tickerList == []:
             queryString  = "SELECT ticker_symbol "
             queryString += " FROM ticker_symbol_list \n"
-            queryString += " WHERE records_daily_adjusted >= 1 \n"
+            queryString += " WHERE records_alpha_daily >= 1 \n"
             query = self._cur.execute(queryString)
             cols = [column[0] for column in query.description]
             results = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
@@ -167,18 +167,37 @@ class filterData:
         if isinstance(indicators, str):
             indicators = ["".join(e for e in indicators if e.isalpha())] # verify that all the text is alphabetical
         if indicators == None:
-            indicators = ["ADJRATIO", "MA20", "MA50", "BOLLINGER20", "BOLLINGER20", "MACD12", \
+            indicators = ["ADJRATIO", "MA20", "MA50", "BOLLINGER20", "BOLLINGER50", "MACD12", \
                           "MACD19", "VOL20", "VOL50", "OBV", "DAYCHANGE", "TOTALCHANGE", "RSI"]
+        
+        # esnure that the related "Typical Price" is included when the bollinger 
+        # bands are calculated.  NOTE: TP doesn't get a specific calc; it is 
+        # only calculated with Bollinger selected.
+        if "BOLLINGER20" in indicators:
+            indicators.insert(indicators.index("BOLLINGER20"), "TP20")
+        if "BOLLINGER50" in indicators:
+            indicators.insert(indicators.index("BOLLINGER50"), "TP50")
+        
         
         
         # Verify the tickers that are being searched are actually in the database.
         self.checkTickersInDatabase(tickerList = tickerList)
         
         # Request the data for each ticker in turn
+        print("Calculating indicators:   ", end="")
+        for i in indicators[:-1]:
+            print(i + ", ", end = "")
+        print("and " + indicators[-1] + ".                                   \n")
+        
         data = pd.DataFrame()
         stockCount = 0
         for ticker in tickerList:
             stockCount += 1
+            if ticker != ticker.upper():
+                print("\r" + ticker + "  Not Upper.")
+            if ticker in ["CODE", "Code", "code"]:
+                print("\r             " + ticker)
+            
             print("\rComputing daily indicators for  " + str(ticker).rjust(7) + "      (" + str(stockCount).rjust(6) + " of " + str(len(tickerList)).ljust(6) + ")         ", end = "")
             
             queryString  = "SELECT * "
@@ -212,10 +231,6 @@ class filterData:
                     series = pd.Series(self._simpleMovingAverage(hist = priceHist, periods = 20))
                 if indicator == "MA50":
                     series = pd.Series(self._simpleMovingAverage(hist = priceHist, periods = 50))
-                if indicator == "BOLLINGER20":
-                    series = pd.Series(self._simpleMovingAverage(hist = priceHist, periods = 20))
-                if indicator == "BOLLINGER50":
-                    series = pd.Series(self._simpleMovingAverage(hist = priceHist, periods = 50))
                 if indicator == "VOL20":
                     series = pd.Series(self._simpleMovingAverage(hist = volHist, periods = 20))
                 if indicator == "VOL50":
@@ -230,6 +245,27 @@ class filterData:
                     series = pd.Series(self._stockAdjustRatio(close = closeHist, adjClose = adjCloseHist))
                 if indicator == "OBV":
                     series = pd.Series(self._onBalanceVolume(close = closeHist, volume = volHist))
+                    
+                if indicator == "BOLLINGER20":
+                    TP, bollinger = pd.Series(self._bollingerBands(high = list(data[self._dailyConversionTable["HIGH"]]), 
+                                                                   low = list(data[self._dailyConversionTable["LOW"]]), 
+                                                                   close = closeHist, 
+                                                                   adjClose = adjCloseHist, 
+                                                                   periods = 20))
+                    data[self._dailyConversionTable["TP20"]] = TP
+                    data[self._dailyConversionTable["BOLLINGER20"]] = bollinger
+                    continue
+                    
+                if indicator == "BOLLINGER50":
+                    TP, bollinger = pd.Series(self._bollingerBands(high = list(data[self._dailyConversionTable["HIGH"]]), 
+                                                                   low = list(data[self._dailyConversionTable["LOW"]]), 
+                                                                   close = closeHist, 
+                                                                   adjClose = adjCloseHist, 
+                                                                   periods = 50))
+                    data[self._dailyConversionTable["TP20"]] = TP
+                    data[self._dailyConversionTable["BOLLINGER50"]] = bollinger
+                    continue
+                    
                 
                 data[self._dailyConversionTable[indicator]] = series.values
             
@@ -678,7 +714,6 @@ class filterData:
         # value in the price data list.
         maArray = [hist[0] for i in range(periods)]  # moving average window
         sma = [hist[0]]                              # moving average
-        std = [1]                                    # moving standard deviation
         
         # for each value in the price history, drop the first (oldest) value in 
         # the moving average window, append the next value from the price history
@@ -688,8 +723,48 @@ class filterData:
             maArray.pop(0)
             maArray.append(val)
             sma.append(sum(maArray) / periods)
-            std.append((sum(((val - sma[-1]) ** 2)) / periods) ** 0.5)
         
+        # return the list of the moving average
+        return sma
+    
+    
+    
+    def _bollingerBands(self,
+                        high, 
+                        low, 
+                        close, 
+                        adjClose, 
+                        periods = 20):
+    
+        # calculate the simple moving average
+        self.validate.validateListFloat(high)
+        self.validate.validateListFloat(low)
+        self.validate.validateListFloat(close)
+        self.validate.validateListFloat(adjClose)
+        self.validate.validateInteger(periods)
+        assert periods >= 2, "'periods' must be an integer of at least 2."
+        
+        # create a list of the historical price data where the length is 
+        # the number of periods, fill it with the first price point, and 
+        # set the Typical Price as the start the average of the high, low, and 
+        # close (adjusted by adjclose).
+        
+        TP = [(a / c) * (h + l + c) / 3 for a, h, l, c in zip(adjClose, high, low, close)]
+        
+        maArray = [TP[0] for i in range(periods)]    # moving average window
+        sma = [TP[0]]                                # moving average
+        std = [0]                                    # moving standard deviation
+        
+        # for each value in the price history, drop the first (oldest) value in 
+        # the moving average window, append the next value from the price history
+        # to the moving average window, and calculate/append the moving average
+        # to the moving average list.
+        for val in TP[1:]:
+            maArray.pop(0)
+            maArray.append(val)
+            sma.append(sum(maArray) / periods)
+            std.append((sum([((ma - sma[-1]) ** 2) for ma in maArray]) / periods) ** 0.5)
+                    
         # return the list of the moving average
         return sma, std
 
@@ -700,7 +775,6 @@ class filterData:
              periods = 14,
              exp = False):
         # calculate the Relative Strength Indicator (RSI); not matching other dataset at barchart
-        
         
         # check inputs for errors or problems
         self.validate.validateListFloat(hist)
@@ -715,15 +789,15 @@ class filterData:
         
         # Calculate the percent change from one day to the next, and inert a '0' as 
         # the first value. 
-        percentChangeArray = [(b-a)/a for a,b in zip(hist[:-1], hist[1:])]
-        percentChangeArray.insert(0,0)
+        changeArray = [(b-a) for a,b in zip(hist[:-1], hist[1:])]
+        changeArray.insert(0,0)
         
         # create a list of the gains (percent change > 0), and losses (percent 
         # change < 0).  The lists will correspond element-for-element with the
         # percent change array, and will have 0's to pad those elements that 
         # should not be in that list.
-        gainArray = [ a if a > 0 else 0 for a in percentChangeArray]
-        lossArray = [-a if a < 0 else 0 for a in percentChangeArray]
+        gainArray = [abs(a) if a > 0 else 0 for a in changeArray]
+        lossArray = [abs(a) if a < 0 else 0 for a in changeArray]
         
         # create a list of rsi values with the length = number of periods, and 
         # will it with 0's.
@@ -744,11 +818,9 @@ class filterData:
             # loss would cause a divide-by-zero error
             for i in range(periods, len(hist)):
                 incrementalGain = ((incrementalGain * (periods-1)) + gainArray[i]) / periods
-                incrementalLoss = ((incrementalLoss * (periods-1)) + lossArray[i]) / periods
-                try:
-                    rs = incrementalGain / incrementalLoss
-                except:
-                    rs = 0
+                incrementalLoss = max(   ((incrementalLoss * (periods-1)) + lossArray[i]) / periods,    0.0000000001)
+                
+                rs = incrementalGain / incrementalLoss
                 
                 # calcuate rsi from the rs value and append it to the array
                 rsi = 100 - (100 / (1 + rs))
@@ -761,13 +833,19 @@ class filterData:
             # simple moving average of the gain and of the loss, calculate 
             # the RSI based on those values, and set RS = 0 if the incremental 
             # loss would cause a divide-by-zero error
+            
+            
+            # get an average for the gain and loss in the price history for the 
+            # first number of periods
+            incrementalGain = sum(gainArray[:periods]) / periods
+            incrementalLoss = sum(lossArray[:periods]) / periods
+            
+            
             for i in range(periods, len(hist)):
                 incrementalGain = sum(gainArray[i-periods:i]) / periods
-                incrementalLoss = sum(lossArray[i-periods:i]) / periods
-                try:
-                    rs = incrementalGain / incrementalLoss
-                except:
-                    rs = 0
+                incrementalLoss = max(    sum(lossArray[i-periods:i]) / periods,    0.000001)
+                
+                rs = incrementalGain / incrementalLoss
                 
                 # calcuate rsi from the rs value and append it to the array
                 rsi = 100 - (100 / (1 + rs))
@@ -856,8 +934,8 @@ if __name__ == "__main__":
         
     info = filterData(dataBaseSaveFile = "stockData.db")
     
-    info.autoSaveIndicators()
-    info.populateSummaryData()
+    info.autoSaveIndicators(tickerList = ["CODE"])
+    #info.populateSummaryData()
     
     
     
