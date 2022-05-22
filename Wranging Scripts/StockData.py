@@ -1581,6 +1581,10 @@ class database:
                         on_bal_vol_trig   INTEGER,
                         rsi               REAL,
                         rsi_trig          INTEGER,
+                        ideal_high        REAL,
+                        ideal_low         REAL,
+                        ideal_return      REAL,
+                        ideal_return_trig INTEGER,
                         CONSTRAINT ticker_date_constraint UNIQUE (
                             ticker_symbol ASC,
                             recordDate

@@ -16,17 +16,44 @@ import analysis2
 
 import datetime as dt
 import os
-import tensorflow as tf # This code has been tested with TensorFlow 1.6
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import OneHotEncoder
+import time
+
+import math
+import tensorflow as tf
+from keras.models import Model
+from keras.models import load_model
+from keras.layers import Dense
+from keras.layers import Activation
+from keras.layers import LSTM
+from keras.layers import Input
+from keras import metrics
+from keras import optimizers
+from keras import callbacks
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.linear_model import LinearRegression
+
+
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.arima_model import ARIMA
+from pmdarima.arima import auto_arima
+from pylab import rcParams
+
 
 
 
 warnings.filterwarnings('ignore')
 
+    
+    
 
-
-
-class models:
+class MLmodels:
     def __init__(self, dataBaseSaveFile = "./stockData.db", splitDate = "2020-01-01"):
         self.DB = sqlite3.connect(dataBaseSaveFile)
         self._cur = self.DB.cursor()
@@ -45,65 +72,480 @@ class models:
         # prevent database corruption.
         self._dailyConversionTable = commonUtilities.conversionTables.dailyConversionTable
         
-        self.indicatorList = {"MA20":        "mvng_avg_20", 
-                              "MA50":        "mvng_avg_50", 
-                              "MACD12":      "macd_12_26", 
-                              "MACD19":      "macd_19_39",
-                              "OBV":         "on_bal_vol", 
-                              "RSI":         "rsi",
-                              "BOLLINGER20": "bollinger_20",
-                              "BOLLINGER50": "bollinger_50"}
+        self.indicatorList = commonUtilities.conversionTables.indicatorList
+        
         self.analysis = analysis2.analysis()
         
+    
+    
+    
+    
+    def LSTM(self, look_back = 120, 
+                   EpochsPerTicker = 1,
+                   fullItterations = 20,
+                   tickerList = [], 
+                   randomSeed = time.time(), 
+                   trainSize = -1, 
+                   trainDate = "01-01-2020",
+                   buildNewLSTM = False):
+        
+        np.random.seed(randomSeed)
+        
+        startTime = dt.datetime.now()
+        self.trainingTimes   = []
+        self.trainingHistory = []
+        self.testingHistory  = []
+        trainHistKeys = ['val_loss', 'val_out_reg_loss', 'val_out_cat_loss', 
+                         'val_out_reg_mse', 'val_out_reg_mape', 'val_out_cat_auc', 
+                         'val_out_cat_catAcc', 'val_out_cat_TP', 'val_out_cat_TN', 
+                         'val_out_cat_FP', 'val_out_cat_FN', 'loss', 'out_reg_loss', 
+                         'out_cat_loss', 'out_reg_mse', 'out_reg_mape', 'out_cat_auc', 
+                         'out_cat_catAcc', 'out_cat_TP', 'out_cat_TN', 'out_cat_FP', 
+                         'out_cat_FN']
         
         
-        def getTickers(self):
-            data = self.analysis.filterStocksFromDataBase(dailyLength = 1250, 
-                                                          maxDailyChange = 50, 
-                                                          minDailyChange = -50, 
-                                                          minDailyVolume = 50000)
+        # Save file for the training data
+        folderName = "./LSTM/" + str(startTime.replace(microsecond=0)) + "/"
+        folderName = folderName.replace(":", ".")
+        os.makedirs(folderName)
+        saveString = folderName + "training_data.csv"
+        dataFile = open(saveString, 'w')
+        dataFile.write("Saved Metrics:\n"
+                       "MeanSquaredError = 'mse'\n" + 
+                       "MeanAbsolutePercentageError = 'mape'\n" + 
+                       "AUC = 'auc'\n" + 
+                       "TruePositives = 'TP'\n" + 
+                       "TrueNegatives = 'TN'\n" + 
+                       "FalsePositives = 'FP'\n" + 
+                       "FalseNegatives = 'FN'\n" + 
+                       "CategoricalAccuracy = 'catAcc'\n" + 
+                       "-------------------------------------\n\n\n")
+
+        dataFile.write("ticker,itteration,elapsed time,training performance\n,,,")
+        for key in trainHistKeys:
+            dataFile.write(key + ",")
+        dataFile.write("\n")
+        dataFile.flush()
+        
+        
+        if tickerList == []:
+            tickerList = self.analysis._tickerList
             
-            self._tickerList = list(data["ticker_symbol"])
-            data['recordDate'] = pd.to_datetime(data['recordDate'])
-            self._data = data
+        if tickerList == []:
+            self.analysis.filterStocksFromDataBase(dailyLength = 1250, 
+                                                    maxDailyChange = 50, 
+                                                    minDailyChange = -50, 
+                                                    minDailyVolume = 500000)
+            tickerList = ["ZNGA"] # self.analysis._tickerList
+        
+        print(str(len(tickerList)).rjust(6) + "  Tickers selected by the filter.             ")
         
         
-        
-        def ARIMA(self):
-            pass
-        
-        
-        
-        
-        def LSTM(self):
+        if buildNewLSTM or (not hasattr(self, 'lstm_model')):
+            inLayer = Input(shape = (look_back, 7))
+            hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
+            hidden2 = Dense(128, name='dense1',  activation = "relu"   )(hidden1)
+            hidden3 = Dense(128, name='dense2',  activation = "relu"   )(hidden2)
+            outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden3)
+            outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden3)
+            opt     = optimizers.Adam(learning_rate = 0.05)
             
-            for ticker in self._tickerList:
+            
+            self.lstm_model = Model(inputs=inLayer, outputs=[outReg, outCat])
+            self.lstm_model.compile(optimizer=opt,
+                                    
+                                    loss = {"out_reg" : "mean_squared_error", 
+                                            "out_cat" : "categorical_crossentropy"}, 
+                                    
+                                    metrics = {"out_reg": [metrics.MeanSquaredError(name = "mse"), 
+                                                           metrics.MeanAbsolutePercentageError(name = "mape")],
+                                               "out_cat": [metrics.AUC(name = "auc"),
+                                                           metrics.CategoricalAccuracy(name = "catAcc"), 
+                                                           metrics.TruePositives(name = "TP"),
+                                                           metrics.TrueNegatives(name = "TN"),
+                                                           metrics.FalsePositives(name = "FP"),
+                                                           metrics.FalseNegatives(name = "FN")]},
+                                    
+                                    loss_weights = {"out_reg": 1.0, "out_cat": 5.0})
+            
+            
+            print("---LSTM model built---\n")
+            self.lstm_model.summary()
+        
+        
+        # save the list of tickers for viewing later
+        stringlist = []
+        self.lstm_model.summary(print_fn=lambda x: stringlist.append(x))
+        short_model_summary = "\n".join(stringlist)
+        
+        saveString = folderName + "tickerList - " + str(len(tickerList)) + ".txt"
+        saveString = saveString.replace(":", ".")
+        tickerFile = open(saveString, 'w')
+        tickerFile.write(short_model_summary)
+        tickerFile.write("\n\n-------------------------------------\n\n\nTickers included for training:\n\n")
+        tickerFile.write(str(tickerList))
+        tickerFile.close()
+        
+        
+        for itteration in range(fullItterations):
+            
+            testX_out  = []
+            testYr_out = []
+            testYc_out = []
+            
+            tickerCounter = 0
+            tickerTotal   = str(len(tickerList))
+            
+            for ticker in tickerList:
+                tickerCounter += 1
                 
-                df = self._data.loc[self._data["ticker_symbol"] == ticker]
+                loadedData, t = self.analysis.loadFromDB(tickerList = [ticker],
+                                                         indicators = ["MA20", "OBV", "IDEAL"],
+                                                         extras = ["HIGH", "LOW", "ADJRATIO", "VOLUME",
+                                                                   "IDEAL_HIGH", "IDEAL_LOW", "IDEAL_TRIG"])
                 
-                high_prices = df['high']
-                low_prices  = df['low']
-                df['mid']  = [h+l/2.0 for h,l in zip(high_prices, low_prices)]
-                
-                
-                train_data = df['mid'].loc[df["recordDate"] < self.splitDate].as_matrix()
-                test_data  = df['mid'].loc[df["recordDate"] > self.splitDate].as_matrix()
-                
-                scaler = MinMaxScaler()
-                train_data = np.log(train_data.reshape(-1,1))
-                test_data  = np.log(test_data.reshape(-1,1))
+                loadedData['recordDate'] = pd.to_datetime(loadedData['recordDate'])
+                loadedData.sort_values(by = ["ticker_symbol", "recordDate"], ascending=True, inplace=True)
                 
                 
-                scaler.fit(train_data)
-                train_data = scaler.transform(train_data).reshape(-1)
-                test_data  = scaler.transform(test_data).reshape(-1)
+                # set the training size to be either a decimal from the funciton input, or to a all records before a set date
+                if trainSize == -1:
+                    trainLen = len(loadedData.loc[loadedData["recordDate"] < pd.to_datetime(trainDate)])
+                elif 0 < trainSize and trainSize < 1:
+                    trainLen = int(trainSize * len(loadedData["recordDate"]))
+                elif trainSize > 1:
+                    trainLen = int(trainSize)
+                else:
+                    trainLen = int(0.8 * len(loadedData["recordDate"]))
+                    
+                
+                print("\nTraining on " + ticker.rjust(6) + "  (" + str(tickerCounter) + " of " + tickerTotal \
+                      + "),  Itteration (" + str(itteration + 1) + " of " + str(fullItterations) \
+                      + "),  Elapsed Time: " + str(dt.datetime.now().replace(microsecond=0) - startTime.replace(microsecond=0)) \
+                      + ",   Train/Test size: " + str(trainLen) + "/" + str(len(loadedData["recordDate"]) - trainLen) + "                  ")
                 
                 
+                # ensure that the adjustment ratio does not cause a div-by-0 error
+                assert min(loadedData["adjustment_ratio"]) > 0, "\n\n  ERROR: adjustment ratio has 0-value.  Verify correct input data.  Ticker = " + ticker
+                
+                
+                # create the input frames that will be translated to numpy arrays
+                inputFrame  = pd.DataFrame()
+                outputFrame = pd.DataFrame()
+                
+                inputFrame["open" ] = [o/a for o,a in zip(loadedData["open"],  loadedData["adjustment_ratio"])]
+                inputFrame["high" ] = [h/a for h,a in zip(loadedData["high"],  loadedData["adjustment_ratio"])]
+                inputFrame["low"  ] = [l/a for l,a in zip(loadedData["low"],   loadedData["adjustment_ratio"])]
+                inputFrame["close"] = [c/a for c,a in zip(loadedData["close"], loadedData["adjustment_ratio"])]
+                inputFrame["ma20" ] = loadedData["mvng_avg_20"]
+                inputFrame["obv"  ] = loadedData["on_bal_vol"]
+                inputFrame["vol"  ] = loadedData["volume"] 
+                
+                outputFrame["high"] = loadedData["ideal_high"]
+                outputFrame["low" ] = loadedData["ideal_low" ]
+                outputFrame["trig"] = [1 if t==1 else 0 for t in loadedData["ideal_return_trig"]]
+                
+                
+                # ----------------------------------------------
+                # scale the inputs and outputs.  Pricing data is separated from the OBV data
+                # Also need to convert to numpy array with dimmensions:
+                # [batch (i.e. time series), timesteps (i.e. trade dates), features (i.e. prices)]
+                # ----------------------------------------------
+                
+                # create scalers for the data
+                inPriceNorm  = MinMaxScaler()
+                inOBVNorm    = MinMaxScaler()
+                inVolNorm    = MinMaxScaler()
+                outPriceNorm = MinMaxScaler()
+                
+                # get the fit data to match the highest high and lowest low so
+                # that all the pricing data is scaled together (relationships between 
+                # features should be maintained).  Then append the OBV data.
+                fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 5)  #should small (min) be 0?  or min('low')?
+                inPriceNorm.fit(fitList)
+                inputs_norm  = inPriceNorm.transform(inputFrame[["open", "high", "low", "close", "ma20"]])
+                inputs_norm  = np.concatenate((inputs_norm, inOBVNorm.fit_transform(inputFrame[["obv"]]).reshape(-1,1)), axis = 1)
+                inputs_norm  = np.concatenate((inputs_norm, inVolNorm.fit_transform(inputFrame[["vol"]]).reshape(-1,1)), axis = 1)
+                
+                
+                # get the fit data to match the highest high and lowest low so
+                # that all the pricing data is scaled together (relationships between 
+                # features should be maintained).  Then append the trigger data.
+                fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 2)
+                outPriceNorm.fit(fitList)
+                outputs_reg = outPriceNorm.transform(outputFrame[["high", "low"]])
+                outputs_cat = OneHotEncoder(sparse = False).fit_transform(outputFrame["trig"].to_numpy().reshape(-1,1))
+                
+                # modify the inputs and outputs to match the LSTM expectations
+                # and separeate into test and train sets
+                trainX, trainYr, trainYc, testX, testYr, testYc = self.prepareLSTMData(inputs_norm, outputs_reg, outputs_cat, look_back = look_back, trainSize = trainLen)
+                self.testX_out.append(testX)
+                self.testYr_out.append(testYr)
+                self.testYc_out.append(testYc)
+                    
+                #---------------------------------------------------
+                # Train the model
+                
+                self.lstm_model.reset_states()
+                trainHist = self.lstm_model.fit(trainX, [trainYr, trainYc], 
+                                                epochs = EpochsPerTicker, 
+                                                verbose = 1, 
+                                                validation_split = 0.2)
+                
+                #--------------------------------------------------
+                # store the training information in memory
+                
+                self.trainingHistory.append( [ticker, itteration, trainHist.history]  )
+                self.trainingTimes.append(   [ticker, itteration, dt.datetime.now() - startTime]  )
+                
+                #--------------------------------------------------
+                # store the training information to disk
+                
+                dataFile.write(ticker + "," + 
+                                str(itteration)+ "," + 
+                                str(dt.datetime.now() - startTime) + ",")
+                
+                for i in range(len(trainHist.history["loss"])):
+                    for key in trainHistKeys:
+                        dataFile.write(str(trainHist.history[key][i]) + ",")
+                    dataFile.write("\n")
+                    if i != len(trainHist.history["loss"]) - 1:
+                        dataFile.write(",,,")
+                    
+                dataFile.flush()
+                
+            
+            #--------------------------------------------------
+            # Save and evalueate the model
+            saveString = folderName + "lstm_model_" + str(itteration+1).zfill(3) + ".h5"
+            self.lstm_model.save(saveString)
+            
+            # evaluation = self.lstm_model.evaluate(testX_out, [testYr_out, testYc_out])
+            # print("Final Results of Training:  " + str(evaluation))
+        
+        dataFile.close()
+        return 
     
     
     
     
+    def getFitArray(self, big, small, features):
+        out = pd.DataFrame()
+        
+        for i in range(features):
+            out[str(i)] = [big, small]
+        
+        return out
     
+    
+    
+    
+    def prepareLSTMData(self, inputs, outputs_r, outputs_c, look_back = 120, trainSize = 0.8):
+        # takes 2D np array of data with axes of time (i.e. trading days) and features,
+        # and returns a 3D np array of batch, time, features
+        
+        dataX, dataY_r, dataY_c = [], [], []
+        lenInput = len(inputs)
+        
+        
+        if trainSize < 1 and trainSize > 0:
+            lenTrain = int(lenInput * trainSize)
+            if trainSize < 0.5:
+                warnings.warn("testSize is declared to be less than half of the dataset; results may not be useful.")
+        elif trainSize > 1:
+            lenTrain = trainSize
+        else:
+            raise ValueError("test size < 0; this is not valid.")
+            
+            
+        for i in range(lenInput - look_back - 1):
+            a = inputs[i:(i+look_back)]
+            dataX.append(a)
+            dataY_r.append(outputs_r[i + look_back])
+            dataY_c.append(outputs_c[i + look_back])
+            
+        
+        trainX = np.array(dataX[:lenTrain])
+        trainYr = np.array(dataY_r[:lenTrain])
+        trainYc = np.array(dataY_c[:lenTrain])
+        
+        testX = np.array(dataX[(lenTrain+1):])
+        testYr = np.array(dataY_r[(lenTrain+1):])
+        testYc = np.array(dataY_c[(lenTrain+1):])
+        
+        return trainX, trainYr, trainYc, testX, testYr, testYc
+    
+    
+    
+    
+    def Trees(self, ticker = ""):
+        # https://www.kaggle.com/code/rishidamarla/stock-market-prediction-using-decision-tree/notebook
+        priceData = self.getTickerData()
+        
+        priceData = priceData[priceData["ticker_symbol"] == ticker]
+        
+        future_days = 100
+        priceData['Prediction'] = priceData['adj_close'].shift(-future_days)
+        
+        X = np.array(priceData.drop(['Prediction'], 1))[:-future_days]
+        y = np.array(priceData['Prediction'])[:-future_days]
+        
+        
+        x_train, x_test, y_train, y_test = train_test_split(X, y, test_size = 0.2)
+        tree = DecisionTreeRegressor().fit(x_train, y_train)
+        
+        x_future = priceData.drop(['Prediction'], 1)[:-future_days]
+        x_future = x_future.tail(future_days)
+        x_future = np.array(x_future)
+        
+        tree_prediction = tree.predict(x_future)
+        
+        predictions = tree_prediction
+        valid = priceData[X.shape[0]:]
+        valid['Predictions'] = predictions
+        
+        plt.figure(figsize=(16,8))
+        plt.title("Model")
+        plt.xlabel('Days')
+        plt.ylabel('Close Price USD ($)')
+        plt.plot(priceData['adj_close'])
+        plt.plot(valid[['adj_close', 'Predictions']])
+        plt.legend(["Original", "Valid", 'Predicted'])
+        plt.show()
+        
+        return tree
+    
+    
+    
+    
+    def linearRegression(self, ticker = ""):
+        # https://www.kaggle.com/code/rishidamarla/stock-market-prediction-using-decision-tree/notebook
+        priceData = self.getTickerData()
+        
+        priceData = priceData[priceData["ticker_symbol"] == ticker]
+        
+        future_days = 100
+        priceData['Prediction'] = priceData['adj_close'].shift(-future_days)
+        
+        X = np.array(priceData.drop(['Prediction'], 1))[:-future_days]
+        y = np.array(priceData['Prediction'])[:-future_days]
+        
+        x_train, x_test, y_train, y_test = train_test_split(X, y, test_size = 0.2)
+        lr = LinearRegression().fit(x_train, y_train)\
+        
+        x_future = priceData.drop(['Prediction'], 1)[:-future_days]
+        x_future = x_future.tail(future_days)
+        x_future = np.array(x_future)
+        
+        lr_prediction = lr.predict(x_future)
+        
+        predictions = lr_prediction
+        valid = priceData[X.shape[0]:]
+        valid['Predictions'] = predictions
+        
+        plt.figure(figsize=(16,8))
+        plt.title("Model")
+        plt.xlabel('Days')
+        plt.ylabel('Close Price USD ($)')
+        plt.plot(priceData['adj_close'])
+        plt.plot(valid[['adj_close', 'Predictions']])
+        plt.legend(["Original", "Valid", 'Predicted'])
+        plt.show()
+        
+        return lr
+    
+    
+    
+    
+    def ARIMA(self, ticker = ""):
+        # https://www.analyticsvidhya.com/blog/2021/07/stock-market-forecasting-using-time-series-analysis-with-arima-model/
+        priceData = self.getTickerData()
+        
+        priceData = priceData[priceData["ticker_symbol"] == ticker]
+        
+        rcParams['figure.figsize'] = 10, 6
+        df_log = np.log(priceData["adj_close"])
+        moving_avg = df_log.rolling(12).mean()
+        std_dev = df_log.rolling(12).std()
+        
+        train_data, test_data = df_log[3:int(len(df_log)*0.9)], df_log[int(len(df_log)*0.9):]
+        
+        model_autoARIMA = auto_arima(train_data, start_p=0, start_q=0,
+                          test='adf',       # use adftest to find optimal 'd'
+                          max_p=3, max_q=3, # maximum p and q
+                          m=1,              # frequency of series
+                          d=None,           # let model determine 'd'
+                          seasonal=False,   # No Seasonality
+                          start_P=0, 
+                          D=0, 
+                          trace=True,
+                          error_action='ignore',  
+                          suppress_warnings=True, 
+                          stepwise=True)
+        
+        print(model_autoARIMA.summary())
+        model_autoARIMA.plot_diagnostics(figsize=(15,8))
+        plt.show()
+        
+        model = ARIMA(train_data, order=(1,1,2))  
+        fitted = model.fit(disp=-1)  
+        print(fitted.summary())
+        
+        fc, se, conf = fitted.forecast(321, alpha=0.05)
+        
+        # Make as pandas series
+        fc_series = pd.Series(fc, index=test_data.index)
+        lower_series = pd.Series(conf[:, 0], index=test_data.index)
+        upper_series = pd.Series(conf[:, 1], index=test_data.index)
+        # Plot
+        plt.figure(figsize=(10,5), dpi=100)
+        plt.plot(train_data, label='training data')
+        plt.plot(test_data, color = 'blue', label='Actual Stock Price')
+        plt.plot(fc_series, color = 'orange',label='Predicted Stock Price')
+        plt.fill_between(lower_series.index, lower_series, upper_series, 
+                         color='k', alpha=.10)
+        plt.title('ARCH CAPITAL GROUP Stock Price Prediction')
+        plt.xlabel('Time')
+        plt.ylabel('ARCH CAPITAL GROUP Stock Price')
+        plt.legend(loc='upper left', fontsize=8)
+        plt.show()
+        
+        mse = mean_squared_error(test_data, fc)
+        print('MSE: '+str(mse))
+        mae = mean_absolute_error(test_data, fc)
+        print('MAE: '+str(mae))
+        rmse = math.sqrt(mean_squared_error(test_data, fc))
+        print('RMSE: '+str(rmse))
+        mape = np.mean(np.abs(fc - test_data)/np.abs(test_data))
+        print('MAPE: '+str(mape))
+        
+        return model
+        
+        
+        
+        
+
+
+
+    
+if __name__ == "__main__":
+    
+    if 'mod' not in locals():
+        mod = MLmodels()
+        print("\n---- New instance of MLmodels created. ----")
+    
+    mod.analysis.filterStocksFromDataBase(dailyLength = 1250, 
+                                          maxDailyChange = 50, 
+                                          minDailyChange = -50, 
+                                          minDailyVolume = 500000)
+    
+    tf.config.list_physical_devices('GPU')
+    
+    lstm, testX, testYr, testYc = mod.LSTM(randomSeed = 7, EpochsPerTicker = 1, fullItterations = 25)
+    # lstm, testX, testY = mod.LSTM(randomSeed = 7, EpochsPerTicker = 10, fullItterations = 20)
+    # tree_model = mod.Trees("APPL")
+    # lr_model = mod.linearRegression("APPL")
+    # arima_model = mod.ARIMA("APPL")
     
     
     

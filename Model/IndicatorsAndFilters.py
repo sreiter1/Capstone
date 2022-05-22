@@ -11,7 +11,7 @@ import datetime
 import sqlite3
 import warnings
 import commonUtilities
-
+import numpy as np
 
 
 
@@ -167,8 +167,9 @@ class filterData:
         if isinstance(indicators, str):
             indicators = ["".join(e for e in indicators if e.isalpha())] # verify that all the text is alphabetical
         if indicators == None:
-            indicators = ["ADJRATIO", "MA20", "MA50", "BOLLINGER20", "BOLLINGER50", "MACD12", \
-                          "MACD19", "VOL20", "VOL50", "OBV", "DAYCHANGE", "TOTALCHANGE", "RSI"]
+            indicators = ["ADJRATIO", "MA20", "MA50", "BOLLINGER20", "BOLLINGER50", \
+                          "MACD12", "MACD19", "VOL20", "VOL50", "OBV", "DAYCHANGE", \
+                          "TOTALCHANGE", "RSI", "IDEAL"]
         
         # esnure that the related "Typical Price" is included when the bollinger 
         # bands are calculated.  NOTE: TP doesn't get a specific calc; it is 
@@ -177,8 +178,11 @@ class filterData:
             indicators.insert(indicators.index("BOLLINGER20"), "TP20")
         if "BOLLINGER50" in indicators:
             indicators.insert(indicators.index("BOLLINGER50"), "TP50")
-        
-        
+        if "IDEAL" in indicators:
+            indicators.insert(indicators.index("IDEAL"), "IDEAL_TRIG")
+            indicators.insert(indicators.index("IDEAL"), "IDEAL_LOW")
+            indicators.insert(indicators.index("IDEAL"), "IDEAL_HIGH")
+            
         
         # Verify the tickers that are being searched are actually in the database.
         self.checkTickersInDatabase(tickerList = tickerList)
@@ -245,7 +249,19 @@ class filterData:
                     series = pd.Series(self._stockAdjustRatio(close = closeHist, adjClose = adjCloseHist))
                 if indicator == "OBV":
                     series = pd.Series(self._onBalanceVolume(close = closeHist, volume = volHist))
+                if indicator == "IDEAL":
+                    ret, high, low, trig  = pd.Series(self._tradeIdealReturn(lookAheadDays = 15,
+                                                                             adjRatIn  = list(data[self._dailyConversionTable["ADJRATIO"]]) , 
+                                                                             low_hist  = list(data[self._dailyConversionTable["CLOSE"   ]]) ,
+                                                                             high_hist = list(data[self._dailyConversionTable["CLOSE"   ]]) ))
                     
+                    data[self._dailyConversionTable["IDEAL"]]      = ret
+                    data[self._dailyConversionTable["IDEAL_HIGH"]] = high
+                    data[self._dailyConversionTable["IDEAL_LOW"]]  = low
+                    data[self._dailyConversionTable["IDEAL_TRIG"]] = trig
+                    continue
+                
+                
                 if indicator == "BOLLINGER20":
                     TP, bollinger = pd.Series(self._bollingerBands(high = list(data[self._dailyConversionTable["HIGH"]]), 
                                                                    low = list(data[self._dailyConversionTable["LOW"]]), 
@@ -255,7 +271,8 @@ class filterData:
                     data[self._dailyConversionTable["TP20"]] = TP
                     data[self._dailyConversionTable["BOLLINGER20"]] = bollinger
                     continue
-                    
+                
+                
                 if indicator == "BOLLINGER50":
                     TP, bollinger = pd.Series(self._bollingerBands(high = list(data[self._dailyConversionTable["HIGH"]]), 
                                                                    low = list(data[self._dailyConversionTable["LOW"]]), 
@@ -265,30 +282,56 @@ class filterData:
                     data[self._dailyConversionTable["TP20"]] = TP
                     data[self._dailyConversionTable["BOLLINGER50"]] = bollinger
                     continue
-                    
+                
                 
                 data[self._dailyConversionTable[indicator]] = series.values
             
             data = data.set_index(data.index)
             self._saveIndicatorsToDB(ticker_symbol = ticker,
                                      indicators = indicators,
-                                     dataframe = data)
-         
+                                     dataframe = data,
+                                     useExtras = True)
+        
         print()
         return data
     
     
     
-    def _saveIndicatorsToDB(self, ticker_symbol, indicators, dataframe):
+    def _saveIndicatorsToDB(self, ticker_symbol, indicators, dataframe, useExtras = False):
         # Saves the data extracted from the price history (i.e. moving averages)
         # back to the database.  
         
-        # start SQL query line
+        # Ensure the record exists in the database by either inserting or ignoring the unique constraint
+        sqlString  = "INSERT OR IGNORE INTO daily_adjusted (ticker_symbol, recordDate) \n"
+        sqlString += "VALUES(?,?);"
+        
+        sqlArray  = pd.DataFrame()
+        sqlArray["ticker_symbol"] = dataframe["ticker_symbol"]
+        sqlArray["recordDate"]    = dataframe.index.astype(str)
+        sqlArray = sqlArray.values.tolist()
+        
+        self._cur.executemany(sqlString, sqlArray)
+        self.DB.commit()
+        
+        # remove this ariable to ensure it does not impact the update lines
+        del sqlArray
+        
+        
+        extras = ["OPEN", "HIGH", "LOW", "CLOSE", "ADJCLOSE", "VOLUME", "DIVIDEND", "SPLIT"]
+        
+        
+        # start SQL query line for updating the indicators
         sqlString  = "UPDATE daily_adjusted \n SET "
-        sqlArray = pd.DataFrame()
+        sqlArray   = pd.DataFrame()
         
         # add each indicator in the list of indicators to the SQL query, along
         # with the associated values.
+        
+        if useExtras:
+            for extra in extras:
+                sqlString += str(self._dailyConversionTable[extra]) + " = ?, \n     "
+                sqlArray[self._dailyConversionTable[extra]] = dataframe[self._dailyConversionTable[extra]]
+            
         for indicator in indicators:
             sqlString += str(self._dailyConversionTable[indicator]) + " = ?, \n     "
             sqlArray[self._dailyConversionTable[indicator]] = dataframe[self._dailyConversionTable[indicator]]
@@ -925,7 +968,83 @@ class filterData:
         return OBV
     
     
-
+    
+    
+    def _tradeIdealHigh(self, 
+                         lookAhead = 15,  # number of days to look forward
+                         hist = []):
+        
+        lenHist = len(hist)
+            
+        if lenHist <= 1:
+            return [0]
+        
+        ideal_h = [max(max(hist[i:min(i+lookAhead,lenHist)]), 0.0001) for i in range(lenHist-1)]  # gets highest price between tomorrow and lookAhead days from now
+        ideal_h.append(hist[-1])
+        
+        return ideal_h
+    
+    
+    
+    
+    def _tradeIdealLow(self, 
+                        lookAhead = 15,  # number of days to look forward
+                        hist = []):
+        
+        lenHist = len(hist)
+        
+        if lenHist <= 1:
+            return [0]
+        
+        ideal_l = [max(min(hist[i:min(i+lookAhead,lenHist)]), 0.0001) for i in range(lenHist-1)]  # gets lowest price between tomorrow and lookAhead days from now
+        ideal_l.append(hist[-1])
+        
+        return ideal_l
+    
+    
+    
+    
+    def _tradeIdealReturn(self, 
+                          lookAheadDays = 15,
+                          adjRatIn  = [], 
+                          low_hist  = [],
+                          high_hist = []):
+        
+        
+        if adjRatIn == [] and high_hist != []:
+            adjRatIn = [1] * len(high_hist)
+            
+        high_hist = [h/a for h,a in zip(high_hist, adjRatIn)]
+        low_hist  = [l/a for l,a in zip(low_hist,  adjRatIn)]
+        
+        
+        high_price = self._tradeIdealHigh(lookAhead = lookAheadDays, hist = high_hist)
+        low_price  = self._tradeIdealLow( lookAhead = lookAheadDays, hist =  low_hist)
+        ret     = [1]*len(high_price)
+        trig    = [0]*len(high_price)
+        
+        
+        buyState = 0  # own no stocks
+        dollars  = 1  # have 1 dollar
+        shares   = 0  # have 0 stocks
+        
+        for i in range(len(high_price)):
+            if low_price[i] == low_hist[i] and (buyState == 0 or buyState == -1):
+                shares = dollars / low_price[i]
+                dollars = 0
+                buyState = 1
+                
+            elif high_price[i] == high_hist[i] and buyState == 1:
+                dollars = shares * high_price[i]
+                shares = 0
+                buyState = -1
+                trig[i] = -1
+                
+            ret[i]  = max(dollars, shares*(low_hist[i] + high_hist[i])/2)
+            trig[i] = buyState
+        
+        
+        return ret, high_price, low_price, trig
 
 
 
@@ -934,8 +1053,8 @@ if __name__ == "__main__":
         
     info = filterData(dataBaseSaveFile = "stockData.db")
     
-    info.autoSaveIndicators(tickerList = ["CODE"])
-    #info.populateSummaryData()
+    info.autoSaveIndicators()
+    info.populateSummaryData()
     
     
     

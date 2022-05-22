@@ -13,13 +13,6 @@ import matplotlib.pyplot as plt
 import warnings
 import random
 
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.tsa.seasonal import seasonal_decompose
-from statsmodels.tsa.arima_model import ARIMA
-from pmdarima.arima import auto_arima
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-import math
-
 warnings.filterwarnings("ignore")
 
 
@@ -46,14 +39,7 @@ class analysis:
         # prevent database corruption.
         self._dailyConversionTable = commonUtilities.conversionTables.dailyConversionTable
         
-        self.indicatorList = {"MA20":        "mvng_avg_20", 
-                              "MA50":        "mvng_avg_50", 
-                              "MACD12":      "macd_12_26", 
-                              "MACD19":      "macd_19_39",
-                              "OBV":         "on_bal_vol", 
-                              "RSI":         "rsi",
-                              "BOLLINGER20": "bollinger_20",
-                              "BOLLINGER50": "bollinger_50"}
+        self.indicatorList = commonUtilities.conversionTables.indicatorList
     
     
     
@@ -406,16 +392,15 @@ class analysis:
             cols = [column[0] for column in query.description]
             rslt_df = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
             
-            # for ind in self.indicatorList.values():
-            #     triggerColumn = self.indicatorList[ind] + "_trig"
-            #     rslt_df[triggerColumn] = None
-            
             
             # start SQL query line for saving the triggers back to the database
             sqlString  = "UPDATE daily_adjusted \n SET "
             sqlArray = pd.DataFrame()
         
-            for ind in self.indicatorList.values():
+            for indicator in indicators:
+                
+                ind = self.indicatorList[indicator]
+                
                 triggerColumn = ind + "_trig"
                 
                 if "macd" in ind:
@@ -451,6 +436,9 @@ class analysis:
                     
                     rslt_df[triggerColumn] = trig
                     rslt_df[triggerColumn].replace(to_replace = np.nan, method = "ffill", inplace = True)
+                    
+                if "ideal" in ind:
+                    pass
                     
                     
                 # add each indicator trigger in the list of indicators to the 
@@ -534,15 +522,15 @@ class analysis:
                     return_n.append(365 * ((y_n[i][-1] ** (1/(365*loss[i][1]/253)))  -1))
                 
             
-            x_p = pd.Series([x+random.randrange(00, 49)/100 for seg in x_p for x in seg]) 
-            x_n = pd.Series([x+random.randrange(50, 99)/100 for seg in x_n for x in seg])  # Slide the loss positions to be between the gain positions on the plots; better shows envelope
+            x_p = pd.Series([x+random.randrange(00, 49)/100 for seg in x_p for x in seg])  # Place gains into the first half of a given day; helps with visulaization
+            x_n = pd.Series([x+random.randrange(50, 99)/100 for seg in x_n for x in seg])  # Place losses into the second half of a given day; helps with visulaization
             
             y_p = pd.Series([100*(y-1) for seg in y_p for y in seg])  # Convert to percent changes
             y_n = pd.Series([100*(y-1) for seg in y_n for y in seg])
             
             plt.figure(dpi = 1000)
             plt.scatter(x_p, y_p, marker = ".", s = min( 5000/len(tickerList), 3), c = "#00cc00", label = "buy",  linewidths = 0, alpha = 1.000)
-            plt.scatter(x_n, y_n, marker = ".", s = min(10000/len(tickerList), 3), c = "#ff0000", label = "sell", linewidths = 0, alpha = 0.125)
+            plt.scatter(x_n, y_n, marker = ".", s = min( 5000/len(tickerList), 3), c = "#ff0000", label = "sell", linewidths = 0, alpha = 0.500)
             plt.title("Scatter Plot of time vs returns " + ind)
             plt.legend(markerscale = 10)
             
@@ -561,12 +549,17 @@ class analysis:
     
     
     
-    def loadFromDB(self, tickerList = [], indicators = [], withTriggers = False):
+    def loadFromDB(self, tickerList = [], indicators = [], extras = [], withTriggers = False):
         self.validate.validateListString(tickerList)
         self.validate.validateListString(indicators)
         for value in indicators:
             if value not in self.indicatorList.keys():
                 raise ValueError("Indicators passed are not listed in analysis module.")
+        
+        
+        for value in extras:
+            if value not in self._dailyConversionTable.keys():
+                raise ValueError("Extras passed are not valid.")
         
         results = pd.DataFrame()
         trigList = []
@@ -574,7 +567,7 @@ class analysis:
         print()
         
         for tick in tickerList:
-            print("\rRetrieving ticker:  '" + str(tick).ljust(6) + "'  with indicators:  " + str(indicators) + ".             ", end = "")
+            # print("\rRetrieving ticker:  '" + str(tick).ljust(6) + "'  with indicators:  " + str(indicators) + ".             ", end = "")
             argList = []
             argList.append(tick)
             queryString = "SELECT [INDICATORS] adj_close, close, open, ticker_symbol, recordDate " +\
@@ -588,6 +581,10 @@ class analysis:
                 indicatorString += self.indicatorList[ind] + ", "
                 if withTriggers:
                     indicatorString += self.indicatorList[ind] + "_trig, "
+            
+            for ext in extras:
+                indicatorString += self._dailyConversionTable[ext] + ", "
+                
             
             queryString = queryString.replace("[INDICATORS]", indicatorString)
             
@@ -655,46 +652,8 @@ class analysis:
         loadedData.to_csv(path_or_buf = newDBName)
         
         print("\nComplete.")
-        return        
+        return
     
-    
-    
-    
-    def ARIMA(self, tickerList = [], indicators = []):
-        
-        if indicators == []:
-            indicators = list(self.indicatorList.keys())
-        if tickerList == []:
-            tickerList = self._tickerList
-        
-        loadedData, trigList = self.loadFromDB(tickerList = tickerList, indicators = indicators, withTriggers = True)
-        
-        
-        loadedData['recordDate'] = pd.to_datetime(loadedData['recordDate'])
-        loadedData = loadedData.set_index("recordDate")
-        df_close = loadedData["adj_close"]
-        
-        
-        result = seasonal_decompose(df_close, model='multiplicative', period = 30)
-        
-        fig = plt.figure()  
-        fig = result.plot()  
-        fig.set_size_inches(16, 9)
-        
-        #if not stationary then eliminate trend
-        #Eliminate trend
-        
-        # from pylab import rcParams
-        # rcParams['figure.figsize'] = 10, 6
-        # df_log = np.log(loadedData["adj_close"])
-        # moving_avg = df_log.rolling(12).mean()
-        # std_dev = df_log.rolling(12).std()
-        # plt.legend(loc='best')
-        # plt.title('Moving Average')
-        # plt.plot(std_dev, color ="black", label = "Standard Deviation")
-        # plt.plot(moving_avg, color="red", label = "Mean")
-        # plt.legend()
-        # plt.show()
             
 
 
@@ -702,17 +661,16 @@ class analysis:
 
 if __name__ == "__main__":
     ana = analysis()
-    ana.filterStocksFromDataBase(dailyLength = 1250, 
-                                 maxDailyChange = 50, 
-                                 minDailyChange = -50, 
-                                 minDailyVolume = 50000)
+    data = ana.filterStocksFromDataBase(dailyLength = 1250, 
+                                        maxDailyChange = 50, 
+                                        minDailyChange = -50, 
+                                        minDailyVolume = 50000)
     
     print("Number of stocks selected:  " + str(len(ana._tickerList)) + ".             ")
     
-    # new = ana.storeTriggers(tickerList = ana._tickerList)
-    # data = ana.plotIndicators(tickerList = ana._tickerList)
-    # ana.ARIMA(tickerList = ana._tickerList)
-    ana.copyTimeSeriesToCSV("copyOfDB.csv")
+    new = ana.storeTriggers(tickerList = ana._tickerList)
+    data = ana.plotIndicators(tickerList = ana._tickerList)
+    # ana.copyTimeSeriesToCSV("copyOfDB.csv")
     
     
     

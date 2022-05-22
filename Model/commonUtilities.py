@@ -21,7 +21,8 @@ class conversionTables:
                               "earnings"     : "earnings",
                               "overview"     : "fundamental_overview",
                               "income"       : "income_statement"}
-        
+    
+    
     # Converts user unput to the columns in the table.  Provides a filter to 
     # prevent database corruption.
     dailyConversionTable =  {"OPEN"         : "open",
@@ -30,6 +31,7 @@ class conversionTables:
                              "LOW"          : "low",
                              "ADJCLOSE"     : "adj_close",
                              "VOLUME"       : "volume",
+                             "DIVIDEND"     : "dividend",
                              "SPLIT"        : "split",
                              "ADJRATIO"     : "adjustment_ratio",
                              "MA20"         : "mvng_avg_20",
@@ -45,7 +47,23 @@ class conversionTables:
                              "OBV"          : "on_bal_vol",
                              "DAYCHANGE"    : "percent_cng_day",
                              "TOTALCHANGE"  : "percent_cng_tot",
-                             "RSI"          : "rsi"}
+                             "RSI"          : "rsi",
+                             "IDEAL"        : "ideal_return",
+                             "IDEAL_HIGH"   : "ideal_high",
+                             "IDEAL_LOW"    : "ideal_low",
+                             "IDEAL_TRIG"   : "ideal_return_trig"}
+    
+    
+    indicatorList = {"MA20"        : "mvng_avg_20", 
+                     "MA50"        : "mvng_avg_50", 
+                     "MACD12"      : "macd_12_26", 
+                     "MACD19"      : "macd_19_39",
+                     "OBV"         : "on_bal_vol", 
+                     "RSI"         : "rsi",
+                     "BOLLINGER20" : "bollinger_20",
+                     "BOLLINGER50" : "bollinger_50",
+                     "IDEAL"       : "ideal_return"}
+    
     
     def loadStockListCSV(self, stockListFileName, saveToDB = True):
         # reads a csv file of stock tickers and optionally saves them to 
