@@ -664,14 +664,14 @@ if __name__ == "__main__":
     data = ana.filterStocksFromDataBase(dailyLength = 1250, 
                                         maxDailyChange = 50, 
                                         minDailyChange = -50, 
-                                        minDailyVolume = 50000)
+                                        minDailyVolume = 500000)
     
     print("Number of stocks selected:  " + str(len(ana._tickerList)) + ".             ")
     
-    new = ana.storeTriggers(tickerList = ana._tickerList)
-    data = ana.plotIndicators(tickerList = ana._tickerList)
+    # new = ana.storeTriggers(tickerList = ana._tickerList)
+    # data = ana.plotIndicators(tickerList = ana._tickerList)
     # ana.copyTimeSeriesToCSV("copyOfDB.csv")
-    
+    ana.copyTimeSeriesToNewDatabase("stockDB_partial.db")
     
     
     
