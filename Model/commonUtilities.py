@@ -200,69 +200,9 @@ class callLimitExceeded(Exception):
     # returns a specific error.
     pass
 
-class vpnResetFailed(Exception):
-    # Occurs if the VPN reset function fails.  This is likely to be triggered
-    # after the API call limit is exceeded if the VPN cannot be reset.
-    pass
 
 
-
-class VPNProcessTools:
-    
-    def _checkIfProcessRunning(self, processName):
-        # Check if there is any running process that contains the given name 
-        # processName.  
-        
-        #Iterate over the all the running process
-        for proc in psutil.process_iter():
-            try:
-                # Check if process name contains the given name string.
-                if processName.lower() in proc.name().lower():
-                    return proc
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                pass
-        return False;
-    
-    
-    
-    def resetVPN(self):
-        print("\n\n   Stopping VPN...")
-        process = self._checkIfProcessRunning("nsv")  # look for the Norton VPN service
-        while process != False: # keep looking until the service is found
-            vpnKillStatus = os.system("schtasks /run /tn killVPN")
-            # stops the norton vpn I am using. The command line needs
-            # run "taskkill /f /im NSV.exe" as an administrator.  This 
-            # command is contained in a batch file that is then added to
-            # to the windows scheduler as an "on demand" task.  This task
-            # is then executed via the line above to avoid the need for
-            # the user (i.e. me) to provide permission for the batch file
-            # to run.  The output is assigned to 'vpnKillStatus', which 
-            # is 0 if completed successfully and 1 otherwise.
-            
-            if vpnKillStatus == 1:
-                raise vpnResetFailed("\nScheduled Task failed to complete successfully.\n")
-            
-            # This opens a security vulnerability if the batch file is altered.
-            time.sleep(3) # helps to keep from confusing the VPN.  3 was pulled from thin air.
-            process = self.tools._checkIfProcessRunning("nsv") # look for the Norton VPN service
-        
-        
-        print("   Restarting VPN...")
-        while process == False:  # if the Norton VPN process doeesn't exist (not runninng), 'process' will be false
-            # Call the OS to start Norton VPN.  The VPN is setup to automatically connect to the servers.
-            os.system("C:\\Program Files\\NortonSecureVPN\\Engine\\5.1.1.5\\nsvUIStub.exe")
-            time.sleep(5)
-            process = self._checkIfProcessRunning("nsv")
-        
-        print("   Resetting API call counter...")
-        # reset the API calls and call times.
-        self._resetTotalApiCalls()
-        apiCallTime = time.time() - 60
-        self._apiRecentCallTimes = [apiCallTime for i in range(self._rate)]
-        print("   API call counter reset.")
-        print("   VPN restart complete.\n\n")
-        
-        return 0    
+  
     
     
     
