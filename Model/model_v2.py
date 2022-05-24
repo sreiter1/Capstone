@@ -31,6 +31,7 @@ from keras.layers import Activation
 from keras.layers import LSTM
 from keras.layers import Input
 from keras import metrics
+from keras import losses
 from keras import optimizers
 from keras import callbacks
 from sklearn.metrics import mean_squared_error, mean_absolute_error
@@ -86,7 +87,7 @@ class MLmodels:
     
     
     
-    def LSTM_load(self, modelToLoad = ""):
+    def LSTM_load(self, modelToLoad = "", learnRate = -1):
         CWDreset = os.getcwd()
         
         if modelToLoad == "":
@@ -119,7 +120,6 @@ class MLmodels:
         print("Loading file: " + self.modelToLoad)
         try:
             self.lstm_model = load_model(self.modelToLoad, compile = False)
-            self.compileLSTM()
             
             
         except:
@@ -132,6 +132,12 @@ class MLmodels:
         except:
             print("Failed to load previous training data.  Check ./LSTM/ to verify that training_data.csv is present.")
         
+        if learnRate == -1:
+            learnRate = trainHist["learn_rate"][-1]
+        else:
+            learnRate = 0.05
+            
+        self.compileLSTM(learnRate = learnRate)
         return trainHist
     
     
@@ -322,11 +328,11 @@ class MLmodels:
     
     def createLSTMNetwork(self, look_back):
         inLayer = Input(shape = (look_back, 7))
-        hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
-        hidden2 = Dense(128, name='dense1',  activation = "relu"   )(hidden1)
+        hidden1 = LSTM(120,  name='LSTM1',   activation = "sigmoid")(inLayer)
+        hidden2 = LSTM(128,  name='LSTM1',   activation = "sigmoid")(hidden1)
         hidden3 = Dense(128, name='dense2',  activation = "relu"   )(hidden2)
         outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden3)
-        outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden3)
+        outCat  = Dense(1,   name='out_cat', activation = "sigmoid")(hidden3)
         
         self.lstm_model = Model(inputs=inLayer, outputs=[outReg, outCat])
         self.compileLSTM()
@@ -337,12 +343,14 @@ class MLmodels:
         
         
         
-    def compileLSTM(self):
-        opt = optimizers.Adam(learning_rate = 0.05)
+    def compileLSTM(self, learnRate = 0.05):
+        opt = optimizers.Adam(learning_rate = learnRate)
         self.lstm_model.compile(optimizer = opt,
-                                loss = {"out_reg" : "mean_squared_error", 
-                                        "out_cat" : "categorical_crossentropy"},
+                                loss = {"out_reg" : [losses.MeanSquaredError(), 
+                                                     losses.MeanAbsoluteError()],
+                                        "out_cat" : losses.BinaryCrossentropy(label_smoothing=0.2)},
                                 metrics = {"out_reg": [metrics.MeanSquaredError(name = "mse"), 
+                                                       metrics.MeanAbsoluteError(name = "mae"),
                                                        metrics.MeanAbsolutePercentageError(name = "mape")],
                                            "out_cat": [metrics.AUC(name = "auc"),
                                                        metrics.CategoricalAccuracy(name = "catAcc"), 
@@ -351,6 +359,7 @@ class MLmodels:
                                                        metrics.FalsePositives(name = "FP"),
                                                        metrics.FalseNegatives(name = "FN")]},
                                 loss_weights = {"out_reg": 1.0, "out_cat": 5.0})
+        self.lstm_model.add_metric(mod.lstm_model.optimizer.learning_rate, name = "learn_rate")
     
     
     
@@ -478,7 +487,7 @@ class MLmodels:
         fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 2)
         outPriceNorm.fit(fitList)
         outputs_reg = outPriceNorm.transform(outputFrame[["high", "low"]])
-        outputs_cat = OneHotEncoder(sparse = False).fit_transform(outputFrame["trig"].to_numpy().reshape(-1,1))
+        outputs_cat = outputFrame["trig"].to_numpy().reshape(-1,1)
         
         # modify the inputs and outputs to match the LSTM expectations
         # and separeate into test and train sets
@@ -674,6 +683,7 @@ if __name__ == "__main__":
     # mod.LSTM_train(EpochsPerTicker = 1, fullItterations = 16)
     data = mod.LSTM_load()
     # lstm_pred = mod.LSTM_test()
+
     
     
     
