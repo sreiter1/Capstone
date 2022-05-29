@@ -298,7 +298,7 @@ class MLmodels:
                     if i == 0:
                         dataString = ticker + "," + \
                                      str(itteration + prevItter)+ "," + \
-                                     str(dt.datetime.now()) + ","
+                                     str(dt.datetime.now()).replace(" ","_") + ","
                     else:
                         dataString += ",,,"
                         
@@ -328,9 +328,9 @@ class MLmodels:
     
     def createLSTMNetwork(self, look_back):
         inLayer = Input(shape = (look_back, 7))
-        hidden1 = LSTM(120,  name='LSTM1',   activation = "sigmoid")(inLayer)
-        hidden2 = LSTM(128,  name='LSTM1',   activation = "sigmoid")(hidden1)
-        hidden3 = Dense(128, name='dense2',  activation = "relu"   )(hidden2)
+        hidden1 = LSTM(60,   name='LSTM1',   activation = "sigmoid", return_sequences=True, )(inLayer)
+        hidden2 = LSTM(30,   name='LSTM2',   activation = "sigmoid")(hidden1)
+        hidden3 = Dense(30,  name='dense2',  activation = "relu"   )(hidden2)
         outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden3)
         outCat  = Dense(1,   name='out_cat', activation = "sigmoid")(hidden3)
         
@@ -346,8 +346,7 @@ class MLmodels:
     def compileLSTM(self, learnRate = 0.05):
         opt = optimizers.Adam(learning_rate = learnRate)
         self.lstm_model.compile(optimizer = opt,
-                                loss = {"out_reg" : [losses.MeanSquaredError(), 
-                                                     losses.MeanAbsoluteError()],
+                                loss = {"out_reg" : losses.MeanAbsoluteError(),
                                         "out_cat" : losses.BinaryCrossentropy(label_smoothing=0.2)},
                                 metrics = {"out_reg": [metrics.MeanSquaredError(name = "mse"), 
                                                        metrics.MeanAbsoluteError(name = "mae"),
@@ -357,17 +356,17 @@ class MLmodels:
                                                        metrics.TruePositives(name = "TP"),
                                                        metrics.TrueNegatives(name = "TN"),
                                                        metrics.FalsePositives(name = "FP"),
-                                                       metrics.FalseNegatives(name = "FN")]},
-                                loss_weights = {"out_reg": 1.0, "out_cat": 5.0})
+                                                       metrics.FalseNegatives(name = "FN")]})
+        
         self.lstm_model.add_metric(mod.lstm_model.optimizer.learning_rate, name = "learn_rate")
     
     
     
     
-    def getFitArray(self, big, small, features):
+    def multiFeatureScalingArray(self, big, small, numFeatures):
         out = pd.DataFrame()
         
-        for i in range(features):
+        for i in range(numFeatures):
             out[str(i)] = [big, small]
         
         return out
@@ -379,7 +378,6 @@ class MLmodels:
         # takes 2D np array of data with axes of time (i.e. trading days) and features,
         # and returns a 3D np array of batch, time, features
         
-        dataX, dataY_r, dataY_c = [], [], []
         lenInput = len(inputs)
         
         
@@ -393,23 +391,74 @@ class MLmodels:
             raise ValueError("test size < 0; this is not valid.")
             
             
-        for i in range(lenInput - look_back - 1):
-            a = inputs[i:(i+look_back)]
-            dataX.append(a)
-            dataY_r.append(outputs_r[i + look_back])
-            dataY_c.append(outputs_c[i + look_back])
-            
-        
-        trainX = np.array(dataX[:lenTrain])
-        trainYr = np.array(dataY_r[:lenTrain])
-        trainYc = np.array(dataY_c[:lenTrain])
-        
-        testX = np.array(dataX[(lenTrain+1):])
-        testYr = np.array(dataY_r[(lenTrain+1):])
-        testYc = np.array(dataY_c[(lenTrain+1):])
+        trainX  = inputs[:lenTrain]
+        trainYr = outputs_r[:lenTrain]
+        trainYc = outputs_c[:lenTrain]
+                           
+        testX   = inputs[(lenTrain+1):]
+        testYr  = outputs_r[(lenTrain+1):]
+        testYc  = outputs_c[(lenTrain+1):]
         
         return trainX, trainYr, trainYc, testX, testYr, testYc
     
+    
+    
+    
+    def normLSTMData(self, shaped_data_in, returnNormalizer = False):
+        # normalizes data based on specific inputs
+        # data_in should be a 3D array of shape batch, time steps, features
+        
+        data_out = []
+        try:
+            features = len(shaped_data_in[0][0])
+        except:
+            features = 1
+            
+        normalizer = MinMaxScaler()
+        
+        for i in range(len(shaped_data_in)):
+            
+            print("\rNormalising itteration  " + str(i) + "                      ", end = "\r")
+            fitData = self.multiFeatureScalingArray(np.amax(shaped_data_in[i]), 
+                                                    np.amin(shaped_data_in[i]), 
+                                                    features)
+            
+            normalizer.fit(fitData)
+            a = normalizer.transform(shaped_data_in[i])
+            data_out.append(a)
+        
+        if returnNormalizer:
+            return np.array(data_out), normalizer
+        else:
+            return np.array(data_out)
+    
+    
+    
+    
+    def reshapeLSTMData(self, data_in, io, look_back = 120):
+        # takes 2D np array of data with axes of time (i.e. trading days) and features,
+        # and returns a 3D np array of batch, time, feature
+        
+        shaped_data = []
+        lenInput = len(data_in)
+        
+        if io == "input":
+            for i in range(lenInput - look_back - 1):
+                print("\rShaping itteration  " + str(i) + "                      ", end = "\r")
+                a = data_in[i:(i+look_back)]
+                shaped_data.append(a)
+                data_out = self.normLSTMData(np.array(shaped_data))
+                
+        else:
+            for i in range(lenInput - look_back - 1):
+                print("\rShaping itteration  " + str(i) + "                      ", end = "\r")
+                a = data_in[i+look_back]
+                shaped_data.append(a)
+                data_out = self.normLSTMData(np.array(shaped_data))
+        
+        return data_out
+        
+        
     
     
     
@@ -465,36 +514,22 @@ class MLmodels:
         # [batch (i.e. time series), timesteps (i.e. trade dates), features (i.e. prices)]
         # ----------------------------------------------
         
-        # create scalers for the data
-        inPriceNorm  = MinMaxScaler()
-        inOBVNorm    = MinMaxScaler()
-        inVolNorm    = MinMaxScaler()
-        outPriceNorm = MinMaxScaler()
+        # Reshape and normalize the data.  Inputs/outputs are broken into segments
+        # that are normalized together to preserve certain relationships between them
+        # and then recombined as inputs and the 2 separate output predictions.  
+        # Once the data has been shaped and scaled, it is split into test and train
+        # sets.
+        input_prc   = self.reshapeLSTMData(inputFrame[["open", "high", "low", "close", "ma20"]].to_numpy(), "input", look_back = look_back)
+        input_obv   = self.reshapeLSTMData(inputFrame[["obv"]].to_numpy().reshape(-1,1), "input", look_back = look_back)
+        input_vol   = self.reshapeLSTMData(inputFrame[["vol"]].to_numpy().reshape(-1,1), "input", look_back = look_back)
+        outputs_reg = self.reshapeLSTMData(outputFrame[["high", "low"]].to_numpy(),      "output", look_back = look_back)
+        outputs_cat = self.reshapeLSTMData(outputFrame["trig"].to_numpy().reshape(-1,1), "output", look_back = look_back)
         
-        # get the fit data to match the highest high and lowest low so
-        # that all the pricing data is scaled together (relationships between 
-        # features should be maintained).  Then append the OBV data.
-        fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 5)  #should small (min) be 0?  or min('low')?
-        inPriceNorm.fit(fitList)
-        inputs_norm  = inPriceNorm.transform(inputFrame[["open", "high", "low", "close", "ma20"]])
-        inputs_norm  = np.concatenate((inputs_norm, inOBVNorm.fit_transform(inputFrame[["obv"]]).reshape(-1,1)), axis = 1)
-        inputs_norm  = np.concatenate((inputs_norm, inVolNorm.fit_transform(inputFrame[["vol"]]).reshape(-1,1)), axis = 1)
+        input_data = np.concatenate((input_prc,  input_obv), axis = 2)
+        input_data = np.concatenate((input_data, input_vol), axis = 2)
         
+        trainX, trainYr, trainYc, testX, testYr, testYc = self.splitLSTMData(input_data, outputs_reg, outputs_cat, look_back = look_back, trainSize = trainLen)
         
-        # get the fit data to match the highest high and lowest low so
-        # that all the pricing data is scaled together (relationships between 
-        # features should be maintained).  Then append the trigger data.
-        fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 2)
-        outPriceNorm.fit(fitList)
-        outputs_reg = outPriceNorm.transform(outputFrame[["high", "low"]])
-        outputs_cat = outputFrame["trig"].to_numpy().reshape(-1,1)
-        
-        # modify the inputs and outputs to match the LSTM expectations
-        # and separeate into test and train sets
-        trainX, trainYr, trainYc, testX, testYr, testYc = self.splitLSTMData(inputs_norm, outputs_reg, outputs_cat, look_back = look_back, trainSize = trainLen)
-        self.testX_out.append(testX)
-        self.testYr_out.append(testYr)
-        self.testYc_out.append(testYc)
         
         return trainX, trainYr, trainYc, testX, testYr, testYc
     
@@ -672,7 +707,7 @@ if __name__ == "__main__":
     mod.analysis.filterStocksFromDataBase(dailyLength = 1250, 
                                           maxDailyChange = 50, 
                                           minDailyChange = -50, 
-                                          minDailyVolume = 5000000)
+                                          minDailyVolume = 500000)
     
     
     # tree = mod.Trees("A")
@@ -680,8 +715,8 @@ if __name__ == "__main__":
     # arima_model = mod.ARIMA("A")
     
     
-    # mod.LSTM_train(EpochsPerTicker = 1, fullItterations = 16)
-    data = mod.LSTM_load()
+    mod.LSTM_train(loadPrevious = False, EpochsPerTicker = 20, fullItterations = 1)
+    # data = mod.LSTM_load()
     # lstm_pred = mod.LSTM_test()
 
     

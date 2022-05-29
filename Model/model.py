@@ -8,7 +8,6 @@ Created on Sun May  8 13:21:21 2022
 import numpy as np
 import pandas as pd
 import matplotlib as plt
-import statsmodels.api as sm
 import warnings
 import sqlite3
 import commonUtilities
@@ -27,12 +26,10 @@ import tensorflow as tf
 from keras.models import load_model
 from keras.models import Model
 from keras.layers import Dense
-from keras.layers import Activation
 from keras.layers import LSTM
 from keras.layers import Input
 from keras import metrics
 from keras import optimizers
-from keras import callbacks
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
@@ -53,15 +50,14 @@ warnings.filterwarnings('ignore')
     
 
 class MLmodels:
-    def __init__(self, dataBaseSaveFile = "./stockData.db", splitDate = "2020-01-01"):
+    def __init__(self, dataBaseSaveFile = "./stockData.db", 
+                 dataBaseThreadCheck = True,
+                 splitDate = "2020-01-01"):
         
         tf.config.list_physical_devices('GPU')
-        self.DB = sqlite3.connect(dataBaseSaveFile)
-        self._cur = self.DB.cursor()
         self._tickerList = []   # Empty list that gets filled with a list of tickers to be considered
         self._data = pd.DataFrame()
         self.tradingDateSet = []  # List of dates in YYYY-MM-DD format that are trading dates in the database
-        self.dailyTableNames = ["alpha", "yahoo"]
         self.splitDate = pd.to_datetime(splitDate)
         
         self.validate = commonUtilities.validationFunctions()
@@ -75,9 +71,12 @@ class MLmodels:
         
         self.indicatorList = commonUtilities.conversionTables.indicatorList
         
-        self.analysis = analysis2.analysis()
-        self.indicators = IndicatorsAndFilters.filterData(dataBaseSaveFile = "stockData.db")
-        self.stockdata = StockData.getAlphaVantageData()
+        self.analysis   = analysis2.analysis(dataBaseSaveFile = dataBaseSaveFile, 
+                                             dataBaseThreadCheck = dataBaseThreadCheck)
+        self.indicators = IndicatorsAndFilters.filterData(dataBaseSaveFile = dataBaseSaveFile, 
+                                                          dataBaseThreadCheck = dataBaseThreadCheck)
+        self.stockdata  = StockData.getAlphaVantageData(dataBaseSaveFile = dataBaseSaveFile, 
+                                                        dataBaseThreadCheck = dataBaseThreadCheck)
         
         self.testX_out  = [] # for the LSTM model
         self.testYr_out = [] # for the LSTM model

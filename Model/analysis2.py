@@ -22,8 +22,8 @@ class missingTicker(Exception):
 
 
 class analysis:
-    def __init__(self, dataBaseSaveFile = "./stockData.db"):
-        self.DB = sqlite3.connect(dataBaseSaveFile)
+    def __init__(self, dataBaseSaveFile = "./stockData.db", dataBaseThreadCheck = True):
+        self.DB = sqlite3.connect(dataBaseSaveFile, check_same_thread=dataBaseThreadCheck)
         self.mainDBName = dataBaseSaveFile
         self._cur = self.DB.cursor()
         self._tickerList = []   # Empty list that gets filled with a list of tickers to be considered
@@ -653,6 +653,53 @@ class analysis:
         
         print("\nComplete.")
         return
+    
+    
+    
+    
+    def searchForStock(self, searchString, name = False):
+        queryString = "SELECT ticker_symbol, name FROM ticker_symbol_list;"
+        
+        query = self._cur.execute(queryString)
+        cols = [column[0] for column in query.description]
+        df = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+        
+        df["name_upper"] = df["name"].str.upper()
+        df["ticker_symbol"] = df["ticker_symbol"].str.upper()
+        searchString = searchString.upper()
+        
+        if name:
+            df["instances"] = df["name_upper"].str.find(searchString)
+            df = df[df.instances != -1]
+            df.reset_index(inplace = True)
+            df.index += 1 
+            df.rename(columns={"name": "Company Name", "ticker_symbol": "Ticker Symbol"}, inplace = True)
+            
+            outputString = df[["Ticker Symbol", "Company Name"]].to_html(classes = "tickertable\" id=\"companyList")
+            
+        
+        else:
+            df["instances"] = df["ticker_symbol"].str.find(searchString)
+            df = df[df.instances != -1]
+            df.reset_index(inplace = True)
+            df.index += 1 
+            df.rename(columns={"name": "Company Name", "ticker_symbol": "Ticker Symbol"}, inplace = True)
+            
+            outputString = df[["Ticker Symbol", "Company Name"]].to_html(classes = "tickertable\" id=\"companyList")
+            
+        
+        outputString  = outputString.replace("dataframe ", "")
+        outputString  = outputString.replace("style=\"text-align: right;\"", "")
+                              
+        outputString  = outputString.replace("<tr>", "<tr onclick=\"rowSelect(this)\">")
+        outputString += """<br><br><script>
+                            function rowSelect(x) {
+                              alert("Getting price data for: " + x.cells[1].innerHTML);
+                              document.getElementById("symbol").value=x.cells[1].innerHTML
+                              document.getElementById("dataForm").submit()
+                            }
+                            </script><br><br>"""
+        return outputString
     
             
 

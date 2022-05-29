@@ -11,15 +11,14 @@ import datetime
 import sqlite3
 import warnings
 import commonUtilities
-import numpy as np
 
 
 
 
 
 class filterData:
-    def __init__(self, dataBaseSaveFile = "./SQLiteDB/stockData.db"):
-        self.DB = sqlite3.connect(dataBaseSaveFile)
+    def __init__(self, dataBaseSaveFile = "./SQLiteDB/stockData.db", dataBaseThreadCheck = True):
+        self.DB = sqlite3.connect(dataBaseSaveFile, check_same_thread = dataBaseThreadCheck)
         self._cur = self.DB.cursor()
         self._tickerList = []     # Empty list that gets filled with a list of tickers to be considered
         

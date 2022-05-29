@@ -18,6 +18,7 @@ import sqlite3
 import os
 import sys
 import commonUtilities
+import numpy as np
 
 
 class callLimitExceeded(Exception):
@@ -28,14 +29,16 @@ class callLimitExceeded(Exception):
 
 
 class getAlphaVantageData:
-    def __init__(self, API_KEY = "NYLUQRD89OVSIL3I", rate = 5, limit = 500, dataBaseSaveFile = "./stockData.db"):
+    def __init__(self, API_KEY = "NYLUQRD89OVSIL3I", rate = 5, limit = 500, dataBaseSaveFile = "./stockData.db", alphaPremiumKey = False, dataBaseThreadCheck = True):
         self.workingFileText = "" # string for printing data to the command line between function calls
-        self.DB = database(dataBaseSaveFile) # SQL object
+        self.DB = database(dataBaseSaveFile, dataBaseThreadCheck = dataBaseThreadCheck) # SQL object
         self._cur = self.DB.stockDB.cursor() # Cursor for SQL transactions
         self._rate = rate   # calls per minute
         self._limit = limit  # calls per day
         self._apiTotalCalls = 0  # number of calls already made
+        self._apiTotalCount = 0
         self._API_KEY = API_KEY  # Key for use with alphaVantage API
+        self._alphaPremium = alphaPremiumKey
         self._alphaVantageBaseURL = "https://www.alphavantage.co/query?" # base URL for alphavantage
         apiCallTime = time.time() - 60 # one minute in the past; ensures that there is no delay prior to the first API calls
         
@@ -324,11 +327,43 @@ class getAlphaVantageData:
     
     
     
-    def _getTimeSeriesDaily(self, ticker_symbol, save = True):
+    def _getTimeSeriesDailyAdjusted(self, ticker_symbol, save = True):
         # Collects the time Series data for a selected ticker
-                    
+        
+        if self._alphaPremium:
+            stockDF = self._getDailyAdjusted(ticker_symbol = ticker_symbol)
+        else:
+            out1 = self._getDaily(ticker_symbol = ticker_symbol)
+            out2 = self._getWeeklyAdjusted(ticker_symbol = ticker_symbol)
+            
+            stockDF = pd.concat([out1, out2], axis=1)
+            stockDF.sort_index(inplace = True, ascending = False)
+            
+            stockDF["adjustment_ratio"] = stockDF["adjustment_ratio"].ffill()
+            stockDF["adj_close"] = [float(c)/float(ar) for c,ar in zip(stockDF["close"], stockDF["adjustment_ratio"])]
+            
+            stockDF["open"]     = [float(o) for o in stockDF["open"]]
+            stockDF["close"]    = [float(c) for c in stockDF["close"]]
+            stockDF["low"]      = [float(l) for l in stockDF["low"]]
+            stockDF["high"]     = [float(h) for h in stockDF["high"]]
+            stockDF["volume"]   = [float(v) for v in stockDF["volume"]]
+            stockDF["dividend"] = [float(d) for d in stockDF["dividend"]]
+            
+            stockDF.drop(columns = ["adjustment_ratio"], inplace = True)
+            
+        
+        # optionally save the data to the SQLite database
+        if save:
+            self.saveToSQL(stockDF, "alphatime", ticker_symbol)
+        
+        return stockDF
+
+    
+    
+    
+    def _getDailyAdjusted(self, ticker_symbol):
         # Build the request URL for alphaVantage API; TIME_SERIES_DAILY_ADJUSTED now requires a subscription
-        requestURL = self._alphaVantageBaseURL + "function=TIME_SERIES_DAILY&" + \
+        requestURL = self._alphaVantageBaseURL + "function=TIME_SERIES_DAILY_ADJUSTED&" + \
                      "outputsize=full&symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
         
         # Check to make sure the API limit and rate set in __init__() have not 
@@ -357,15 +392,91 @@ class getAlphaVantageData:
                         "7. dividend amount": "dividend",
                         "8. split coefficient": "split"}, axis=1, inplace=True)
         
+        
         stockDF['ticker_symbol'] = ticker_symbol
         stockDF['recordDate'] = stockDF.index
         
-        # optionally save the data to the SQLite database
-        if save:
-            self.saveToSQL(stockDF, "alphatime", ticker_symbol)
+        # return the downloaded data back from the function
+        return stockDF
+    
+    
+    
+    
+    def _getDaily(self, ticker_symbol):
+        # Collects the time Series data for a selected ticker
+                    
+        # Build the request URL for alphaVantage API; TIME_SERIES_DAILY_ADJUSTED now requires a subscription
+        requestURL = self._alphaVantageBaseURL + "function=TIME_SERIES_DAILY&" + \
+                     "outputsize=full&symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
+        
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.
+        self._checkApiCalls()
+        
+        # Send API request and extract the JSON data
+        response = requests.get(requestURL)
+        data = response.json()
+        
+        # Check the response for errors
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "alphatime"):
+            return None
+        
+        # Extract the data from the response and convert it to a dataframe
+        stockDF = pd.DataFrame(data["Time Series (Daily)"])
+        stockDF = stockDF.transpose()
+        
+        stockDF.rename({"1. open": "open",
+                        "2. high": "high",
+                        "3. low": "low",
+                        "4. close": "close",
+                        "5. volume": "volume"}, axis=1, inplace=True)
+        
+        stockDF['ticker_symbol'] = ticker_symbol
+        stockDF['recordDate'] = stockDF.index
         
         # return the downloaded data back from the function
         return stockDF
+    
+    
+    
+    
+    def _getWeeklyAdjusted(self, ticker_symbol):
+        # Collects the time Series data for a selected ticker
+                    
+        # Build the request URL for alphaVantage API; TIME_SERIES_DAILY_ADJUSTED now requires a subscription
+        requestURL = self._alphaVantageBaseURL + "function=TIME_SERIES_WEEKLY_ADJUSTED&" + \
+                     "outputsize=full&symbol=" + ticker_symbol + "&apikey=" + self._API_KEY
+        
+        # Check to make sure the API limit and rate set in __init__() have not 
+        # been exceeded; function will delay execution to ensure that the rate 
+        # is not exceeded.
+        self._checkApiCalls()
+        
+        # Send API request and extract the JSON data
+        response = requests.get(requestURL)
+        data = response.json()
+        
+        # Check the response for errors
+        if self._checkForErrorsUpdateTickerSymbol(ticker_symbol, data, "alphatime"):
+            return None
+        
+        # Extract the data from the response and convert it to a dataframe
+        stockDF = pd.DataFrame(data["Weekly Adjusted Time Series"])
+        stockDF = stockDF.transpose()
+    
+        stockDF["adjustment_ratio"] = [float(a)/float(b) for a,b in zip(stockDF["4. close"], stockDF["5. adjusted close"])]
+        stockDF.rename({"5. adjusted close": "adj_close",
+                        "7. dividend amount": "dividend"}, axis=1, inplace=True)
+        stockDF["split"] = [np.nan] * len(stockDF["adj_close"])
+        stockDF["recordDate"] = stockDF.index
+        
+        stockDF.drop(columns = ["1. open", "2. high", "3. low", "4. close", "6. volume", "recordDate"], inplace=True)
+        
+        # return the downloaded data back from the function
+        return stockDF
+    
+    
     
     
 
@@ -1055,8 +1166,7 @@ class getAlphaVantageData:
         # one metric, that is the only metric downloaded.  
         resultsDict = {}
         
-        # Number of required API calls; can be used for tracking, but not currently
-        # used
+        # Number of required API calls. can be used for tracking
         self._apiTotalCount = 0
         
         # Execute the search for each metric in the database and compile the results.
@@ -1431,12 +1541,12 @@ class getYahooData:
 
 
 class database:
-    def __init__(self, dataBaseSaveFile = "SQLiteDB/stockData.db"):
+    def __init__(self, dataBaseSaveFile = "SQLiteDB/stockData.db", dataBaseThreadCheck = True):
         if(os.path.exists(dataBaseSaveFile)):
             self.stockDB = sqlite3.connect(dataBaseSaveFile)
         else:
             try:
-                self.stockDB = self.createStockDatabase(dataBaseSaveFile)
+                self.stockDB = self.createStockDatabase(dataBaseSaveFile, check_same_thread = dataBaseThreadCheck)
                 self.DBcursor = self.stockDB.cursor()
             except:
                 print("Failed to connect to stock database.")
@@ -1819,7 +1929,7 @@ if __name__ == "__main__":
     
     info = getAlphaVantageData()
     
-    info.confirmDatesAndCounts()
+    # info.confirmDatesAndCounts()
     
     # TIME_SERIES_DAILY_ADJUSTED is a paid option for function _getTimeSeriesDaily()
     # Now using TIME_SERIES_DAILY instead.  May consider using weekly adjusted 
