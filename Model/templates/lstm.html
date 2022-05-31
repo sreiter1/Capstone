@@ -5,23 +5,9 @@
 
 <body>
 
+
 {% include 'topMenu.html' %}
 
-<!-- Header with image -->
-<!-- <header class="bgimg w3-display-container w3-grayscale-min" id="home">
-  <div class="w3-display-bottomleft w3-center w3-padding-large w3-hide-small">
-    <span class="w3-tag">Open from 6am to 5pm</span>
-  </div>
-  <div class="w3-display-middle w3-center">
-    <span class="w3-text-white" style="font-size:90px">the<br>Cafe</span>
-  </div>
-  <div class="w3-display-bottomright w3-center w3-padding-large">
-    <span class="w3-text-white">15 Adr street, 5015</span>
-  </div>
-</header> -->
-
-
-<!-- Add a background color and large text to the whole page -->
 <div class="w3-sand w3-grayscale w3-large">
 
 <!-- About Container -->
@@ -29,7 +15,6 @@
   <div class="w3-content" style="max-width:700px">
     <h2 class="w3-center w3-padding-32"><span class="w3-tag w3-wide"></span></h2>
     <h2 class="w3-center w3-padding-small"><span class="w3-tag w3-wide">LSTM Model</span></h2>
-	
 	<br>
     <h4 class="w3-left-align w3-padding-small"><span>Description:</span></h4>
 	<p>The Long Short Term Memory (LSTM) funtion was trained on several tickers to estimate the highest and lowest price within the next 15 trading days based on the recent trading prices.  It will also produce a buy/sell recomendation.</p>
@@ -39,7 +24,7 @@
 	<p>{% include 'tickerSearch.html' %}</p>
 		<div>
 		  {% include 'tickerSearchResults.html' %}
-		  {% include 'execFuncGen.html' %}
+		  {% include 'generatePrediction.html' %}
 		  {% include 'stockPrediction.html' %}
 		</div>
 	<br>
@@ -47,16 +32,9 @@
 	<p>{% include 'lstmAPI.html' %}</p>
 	
 	
-    <div class="w3-panel w3-leftbar w3-light-grey">
-      <p><i>Full request: </i></p>
-      <p><i>http://site/query?function=LSTM&symbol=A&date=01-01-2021</i></p>
-    </div>
 	
   </div>
-	
-	
-
-<!-- End page content -->
+</div>	
 </div>
 
 <!-- Footer -->

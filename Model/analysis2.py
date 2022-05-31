@@ -692,11 +692,10 @@ class analysis:
         outputString  = outputString.replace("style=\"text-align: right;\"", "")
                               
         outputString  = outputString.replace("<tr>", "<tr onclick=\"rowSelect(this)\">")
-        outputString += """<br><br><script>
+        outputString += """\n<br><br>\n<script>
                             function rowSelect(x) {
-                              alert("Getting price data for: " + x.cells[1].innerHTML);
                               document.getElementById("symbol").value=x.cells[1].innerHTML
-                              document.getElementById("dataForm").submit()
+                              document.getElementById("predictForm").submit()
                             }
                             </script><br><br>"""
         return outputString

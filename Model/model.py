@@ -9,11 +9,11 @@ import numpy as np
 import pandas as pd
 import matplotlib as plt
 import warnings
-import sqlite3
 import commonUtilities
 import analysis2
 import IndicatorsAndFilters
 import StockData
+import pickle
 
 import datetime as dt
 import os
@@ -38,7 +38,7 @@ from sklearn.tree import DecisionTreeRegressor
 from sklearn.linear_model import LinearRegression
 
 
-from statsmodels.tsa.arima_model import ARIMA
+from statsmodels.tsa.arima.model import ARIMA
 from pmdarima.arima import auto_arima
 from pylab import rcParams
 
@@ -136,28 +136,31 @@ class MLmodels:
     
     
     
-    def LSTM_eval(self):
+    def LSTM_eval(self, ticker = "",
+                  savePlt = False, 
+                  evaluate = True, 
+                  predLen = 100, 
+                  plotWindow = 600,
+                  timestampstr = ""):
+        
         assert hasattr(self, "lstm_model"), "LSTM Model missing.  Train a new model with LSTM_train() or load a model with LSTM_load()."        
         
-        self.testX_out, self.testYr_out, self.testYc_out = [], [], []
+        if evaluate:
+            trainSize = -1
+        else:
+            trainSize = 0.9
         
-        for ticker in self.analysis._tickerList:
-            trainX, trainYr, trainYc, testX, testYr, testYc = self.getLSTMTestTrainData(ticker = ticker)
-            self.testX_out.append(testX)
-            self.testYr_out.append(testYr)
-            self.testYc_out.append(testYc)
-            
-            
+        trainX, trainYr, trainYc, testX, testYr, testYc = self.getLSTMTestTrainData(ticker = ticker, 
+                                                                                    trainSize = trainSize)
         
-        pred = []
-        for i in range(len(self.testX_out)):
-            pred.append(self.lstm_model.predict(self.testX_out[i]))
         
-        evaluation = []
-        for i in range(len(self.testX_out)):
-            evaluation.append(self.lstm_model.evaluate(self.testX[i], [self.testYr_out[i], self.testYc_out[i]]))
+        evaluation = self.lstm_model.evaluate(testX, [testYr, testYc])
         
-        return pred, evaluation
+        
+        prediction = self.lstm_model.predict(testX)
+        
+        
+        return prediction, evaluation, testX, [testYr, testYc]
     
     
     
@@ -320,12 +323,25 @@ class MLmodels:
     
     
     def createLSTMNetwork(self, look_back):
+        # Model 1:
+        # inLayer = Input(shape = (look_back, 7))
+        # hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
+        # hidden2 = Dense(128, name='dense1',  activation = "relu"   )(hidden1)
+        # hidden3 = Dense(128, name='dense2',  activation = "relu"   )(hidden2)
+        # outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden3)
+        # outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden3)
+        
+        # self.lstm_model = Model(inputs=inLayer, outputs=[outReg, outCat])
+        # self.compileLSTM()
+        
+        
+        
+        # Model 2
         inLayer = Input(shape = (look_back, 7))
         hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
         hidden2 = Dense(128, name='dense1',  activation = "relu"   )(hidden1)
-        hidden3 = Dense(128, name='dense2',  activation = "relu"   )(hidden2)
-        outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden3)
-        outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden3)
+        outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden2)
+        outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden2)
         
         self.lstm_model = Model(inputs=inLayer, outputs=[outReg, outCat])
         self.compileLSTM()
@@ -365,7 +381,7 @@ class MLmodels:
     
     
     
-    def splitLSTMData(self, inputs, outputs_r, outputs_c, look_back = 120, trainSize = 0.8):
+    def splitLSTMData(self, inputs, outputs_r, outputs_c, look_back = 200, trainSize = 0.8):
         # takes 2D np array of data with axes of time (i.e. trading days) and features,
         # and returns a 3D np array of batch, time, features
         
@@ -420,7 +436,7 @@ class MLmodels:
         # set the training size to be either a decimal from the funciton input, or to a all records before a set date
         if trainSize == -1:
             trainLen = len(loadedData.loc[loadedData["recordDate"] < pd.to_datetime(trainDate)])
-        elif 0 < trainSize and trainSize < 1:
+        elif 0 < trainSize and trainSize <= 1:
             trainLen = int(trainSize * len(loadedData["recordDate"]))
         elif trainSize > 1:
             trainLen = min(int(trainSize), len(loadedData["recordDate"]-1))
@@ -491,95 +507,206 @@ class MLmodels:
     
     
     
-    def Trees(self, ticker = "", future_days = 100):
+    def Trees(self, ticker = "", 
+              savePlt = False, 
+              evaluate = True, 
+              predLen = 100, 
+              plotWindow = 600,
+              timestampstr = ""):
         # https://www.kaggle.com/code/rishidamarla/stock-market-prediction-using-decision-tree/notebook
-        priceData, t = self.analysis.loadFromDB(tickerList = [ticker],
+        loadedData, t = self.analysis.loadFromDB(tickerList = [ticker],
                                                 indicators = ["MA20", "OBV", "IDEAL"],
                                                 extras = ["HIGH", "LOW", "ADJRATIO", "VOLUME",
                                                           "IDEAL_HIGH", "IDEAL_LOW", "IDEAL_TRIG"])
         
-        priceData = priceData[priceData["ticker_symbol"] == ticker]
+        priceData = loadedData[loadedData["ticker_symbol"] == ticker]
         priceData = priceData.drop(["ticker_symbol"], 1)
         priceData = priceData.drop(["recordDate"], 1)
         
-        priceData["Prediction"] = priceData["adj_close"].shift(-future_days)
+        priceData["Prediction"] = priceData["adj_close"].shift(-predLen)
         
-        X = np.array(priceData.drop(["Prediction"], 1))[:-future_days]
-        y = np.array(priceData["Prediction"])[:-future_days]
+        X = np.array(priceData.drop(["Prediction"], 1))[:-predLen]
+        y = np.array(priceData["Prediction"])[:-predLen]
         
-        x_train, x_test, y_train, y_test = train_test_split(X, y, test_size = 0.2)
+        if evaluate:
+            x_train, x_test, y_train, y_test = train_test_split(X, y, test_size = 0.2)
+            
+            x_future = priceData.drop(["Prediction"], 1)[:-predLen]
+            x_future = x_future.tail(predLen)
+            predIndex = max(x_future.index)
+            x_future = np.array(x_future)
+            
+            y_future = priceData["Prediction"][:-predLen]
+            y_future = y_future.tail(predLen)
+            y_future = np.array(y_future)
+            
+        else:
+            x_train = X
+            y_train = y
+            
+            x_future = priceData.drop(["Prediction"], 1)
+            x_future = x_future.tail(predLen*2)
+            predIndex = max(x_future.index) - predLen
+            x_future = np.array(x_future)
+        
+        
         tree = DecisionTreeRegressor().fit(x_train, y_train)
+    
+        predictions = tree.predict(x_future)
+        predictions = pd.DataFrame(predictions)
+        predictions = pd.concat([predictions, pd.Series(list(range(predIndex, predIndex + len(predictions))))], axis = 1)
+        predictions.columns = ["treePrediction","ind"]
+        predictions = predictions.set_index("ind")
         
-        x_future = priceData.drop(["Prediction"], 1)[:-future_days]
-        x_future = x_future.tail(future_days)
-        x_future = np.array(x_future)
-        
-        tree_prediction = tree.predict(x_future)
-        
-        predictions = tree_prediction
         valid = priceData[X.shape[0]:]
-        valid["Predictions"] = predictions
-        
         
         plt.figure.Figure(figsize=(16,8))
         plt.pyplot.title("Model")
         plt.pyplot.xlabel("Days")
         plt.pyplot.ylabel("Close Price USD ($)")
         plt.pyplot.plot(priceData["adj_close"])
-        plt.pyplot.plot(valid[["adj_close", "Predictions"]])
-        plt.pyplot.legend(["Original", "Valid", "Predicted"])
-        plt.pyplot.show()
+        plt.pyplot.plot(valid["adj_close"])
+        plt.pyplot.plot(predictions)
+        plt.pyplot.xlim([len(priceData)-plotWindow, len(priceData)+predLen])
+        plt.pyplot.legend(["Original", "True", "Predicted"])
         
-        return tree
+        if savePlt:
+            plt.pyplot.savefig("./static/Tree_1_" + timestampstr + ".png")
+        else:
+            plt.pyplot.show()
+        
+        if evaluate:
+            print("Linear Regression performance: ")
+            mse = mean_squared_error(y_future, predictions["treePrediction"])
+            print('MSE: '+str(mse))
+            mae = mean_absolute_error(y_future, predictions["treePrediction"])
+            print('MAE: '+str(mae))
+            rmse = math.sqrt(mean_squared_error(y_future, predictions["treePrediction"]))
+            print('RMSE: '+str(rmse))
+            mape = np.mean(np.abs(predictions["treePrediction"] - y_future)/np.abs(y_future))
+            print('MAPE: '+str(mape))
+            
+            mets = {"MAE" : str(mae),
+                    "MSE" : str(mse),
+                    "RMSE": str(rmse),
+                    "MAPE": str(mape)}
+        
+        else:
+            mets = {}
+        
+        endData = pd.concat([predictions, priceData], axis = 1)
+        plt.pyplot.close("all")
+        
+        return tree, endData, mets
+        
     
     
     
     
-    def linearRegression(self, ticker = "", future_days = 100):
+    def linearRegression(self, ticker = "", 
+                         savePlt = False, 
+                         evaluate = True, 
+                         predLen = 100, 
+                         plotWindow = 600,
+                         timestampstr = ""):
         # https://www.kaggle.com/code/rishidamarla/stock-market-prediction-using-decision-tree/notebook
-        priceData, t = self.analysis.loadFromDB(tickerList = [ticker],
+        loadedData, t = self.analysis.loadFromDB(tickerList = [ticker],
                                                 indicators = ["MA20", "OBV", "IDEAL"],
                                                 extras = ["HIGH", "LOW", "ADJRATIO", "VOLUME",
                                                           "IDEAL_HIGH", "IDEAL_LOW", "IDEAL_TRIG"])
         
-        
-        priceData = priceData[priceData["ticker_symbol"] == ticker]
+        priceData = loadedData[loadedData["ticker_symbol"] == ticker]
         priceData = priceData.drop(["ticker_symbol"], 1)
         priceData = priceData.drop(["recordDate"], 1)
         
-        priceData["Prediction"] = priceData["adj_close"].shift(-future_days)
+        priceData["Prediction"] = priceData["adj_close"].shift(-predLen)
         
-        X = np.array(priceData.drop(["Prediction"], 1))[:-future_days]
-        y = np.array(priceData["Prediction"])[:-future_days]
+        X = np.array(priceData.drop(["Prediction"], 1))[:-predLen]
+        y = np.array(priceData["Prediction"])[:-predLen]
         
-        x_train, x_test, y_train, y_test = train_test_split(X, y, test_size = 0.2)
-        lr = LinearRegression().fit(x_train, y_train)
+        if evaluate:
+            x_train, x_test, y_train, y_test = train_test_split(X, y, test_size = 0.2)
+            
+            x_future = priceData.drop(["Prediction"], 1)[:-predLen]
+            x_future = x_future.tail(predLen)
+            predIndex = max(x_future.index)
+            x_future = np.array(x_future)
+            
+            y_future = priceData["Prediction"][:-predLen]
+            y_future = y_future.tail(predLen)
+            y_future = np.array(y_future)
+            
+        else:
+            x_train = X
+            y_train = y
+            
+            x_future = priceData.drop(["Prediction"], 1)
+            x_future = x_future.tail(predLen*2)
+            predIndex = max(x_future.index) - predLen
+            x_future = np.array(x_future)
         
-        x_future = priceData.drop(["Prediction"], 1)[:-future_days]
-        x_future = x_future.tail(future_days)
-        x_future = np.array(x_future)
         
-        lr_prediction = lr.predict(x_future)
+        lr = LinearRegression()
+        lr.fit(x_train, y_train)
         
-        predictions = lr_prediction
+        predictions = lr.predict(x_future)
+        predictions = pd.DataFrame(predictions)
+        predictions = pd.concat([predictions, pd.Series(list(range(predIndex, predIndex + len(predictions))))], axis = 1)
+        predictions.columns = ["val","ind"]
+        predictions = predictions.set_index("ind")
+        
         valid = priceData[X.shape[0]:]
-        valid["Predictions"] = predictions
         
         plt.figure.Figure(figsize=(16,8))
         plt.pyplot.title("Model")
         plt.pyplot.xlabel("Days")
         plt.pyplot.ylabel("Close Price USD ($)")
         plt.pyplot.plot(priceData["adj_close"])
-        plt.pyplot.plot(valid[["adj_close", "Predictions"]])
-        plt.pyplot.legend(["Original", "Valid", "Predicted"])
-        plt.pyplot.show()
+        plt.pyplot.plot(valid["adj_close"])
+        plt.pyplot.plot(predictions)
+        plt.pyplot.xlim([len(priceData)-plotWindow, len(priceData)+predLen])
+        plt.pyplot.legend(["Original", "True", "Predicted"])
         
-        return lr
+        if savePlt:
+            plt.pyplot.savefig("./static/Linear_1_" + timestampstr + ".png")
+        else:
+            plt.pyplot.show()
+        
+        if evaluate:
+            print("Linear Regression performance: ")
+            mse = mean_squared_error(y_future, predictions)
+            print('MSE: '+str(mse))
+            mae = mean_absolute_error(y_future, predictions)
+            print('MAE: '+str(mae))
+            rmse = math.sqrt(mean_squared_error(y_future, predictions))
+            print('RMSE: '+str(rmse))
+            mape = np.mean(np.abs(predictions["val"] - y_future)/np.abs(y_future))
+            print('MAPE: '+str(mape))
+            
+            mets = {"MAE" : str(mae),
+                    "MSE" : str(mse),
+                    "RMSE": str(rmse),
+                    "MAPE": str(mape)}
+        
+        else:
+            mets = {}
+        
+        endData = pd.concat([predictions, priceData], axis = 1)
+        plt.pyplot.close("all")
+        
+        return lr, endData, mets
     
     
     
     
-    def ARIMA(self, ticker = ""):
+    def ARIMA(self, ticker = "", 
+              confInterval = 0.2, 
+              savePlt = False, 
+              evaluate = True, 
+              predLen = 500, 
+              plotWindow=600,
+              timestampstr = ""):
+        
         # https://www.analyticsvidhya.com/blog/2021/07/stock-market-forecasting-using-time-series-analysis-with-arima-model/
         priceData, t = self.analysis.loadFromDB(tickerList = [ticker],
                                                 indicators = ["MA20", "OBV", "IDEAL"],
@@ -590,10 +717,13 @@ class MLmodels:
         
         rcParams['figure.figsize'] = 10, 6
         df_log = np.log(priceData["adj_close"])
-        moving_avg = df_log.rolling(12).mean()
-        std_dev = df_log.rolling(12).std()
         
-        train_data, test_data = df_log[3:int(len(df_log)*0.9)], df_log[int(len(df_log)*0.9):]
+        if evaluate:
+            train_data, test_data = df_log[3:int(len(df_log)*0.8)], df_log[int(len(df_log)*0.8):]
+        else:
+            train_data = df_log[3:int(len(df_log))]
+            test_data = pd.concat([df_log, pd.Series([np.nan]*predLen)], ignore_index=True)
+        
         
         model_autoARIMA = auto_arima(train_data, start_p=0, start_q=0,
                           test='adf',       # use adftest to find optimal 'd'
@@ -610,41 +740,203 @@ class MLmodels:
         
         print(model_autoARIMA.summary())
         model_autoARIMA.plot_diagnostics(figsize=(15,8))
-        plt.show()
+        if savePlt:
+            plt.pyplot.savefig("./static/ARIMA_1_" + timestampstr + ".png")
+        else:
+            plt.pyplot.show()
         
-        model = ARIMA(train_data, order=(1,1,2))  
-        fitted = model.fit(disp=-1)  
+        
+        model = ARIMA(train_data, order=(1,1,2))
+        fitted = model.fit()
         print(fitted.summary())
         
-        fc, se, conf = fitted.forecast(321, alpha=0.05)
+        
+        preRes = fitted.get_forecast(steps = predLen)
+        
+        fc = np.exp(preRes.predicted_mean)
+        conf = np.exp(preRes.conf_int(alpha=confInterval))
+        train_data = np.exp(train_data)
+        test_data = np.exp(test_data)
         
         # Make as pandas series
         fc_series = pd.Series(fc, index=test_data.index)
-        lower_series = pd.Series(conf[:, 0], index=test_data.index)
-        upper_series = pd.Series(conf[:, 1], index=test_data.index)
+        lower_series = pd.Series(conf["lower adj_close"], index=test_data.index)
+        upper_series = pd.Series(conf["upper adj_close"], index=test_data.index)
         # Plot
-        plt.figure(figsize=(10,5), dpi=100)
-        plt.plot(train_data, label='training data')
-        plt.plot(test_data, color = 'blue', label='Actual Stock Price')
-        plt.plot(fc_series, color = 'orange',label='Predicted Stock Price')
-        plt.fill_between(lower_series.index, lower_series, upper_series, 
-                         color='k', alpha=.10)
-        plt.title('ARCH CAPITAL GROUP Stock Price Prediction')
-        plt.xlabel('Time')
-        plt.ylabel('ARCH CAPITAL GROUP Stock Price')
-        plt.legend(loc='upper left', fontsize=8)
-        plt.show()
+        plt.pyplot.figure(figsize=(10,5), dpi=100)
+        plt.pyplot.plot(train_data, label='training data')
+        plt.pyplot.plot(test_data, color = 'blue', label='Actual Stock Price')
+        plt.pyplot.plot(fc_series, color = 'orange',label='Predicted Stock Price')
+        plt.pyplot.fill_between(lower_series.index, lower_series, upper_series, 
+                          color='k', alpha=.10)
+        plt.pyplot.title(ticker)
+        plt.pyplot.xlabel('Time')
+        plt.pyplot.ylabel(ticker  + ' Stock Price')
+        plt.pyplot.legend(loc='upper left', fontsize=8)
+        plt.pyplot.xlim([len(priceData)-plotWindow, len(priceData)+predLen])
+        if savePlt:
+            plt.pyplot.savefig("./static/ARIMA_2_" + timestampstr + ".png")
+        else:
+            plt.pyplot.show()
         
-        mse = mean_squared_error(test_data, fc)
-        print('MSE: '+str(mse))
-        mae = mean_absolute_error(test_data, fc)
-        print('MAE: '+str(mae))
-        rmse = math.sqrt(mean_squared_error(test_data, fc))
-        print('RMSE: '+str(rmse))
-        mape = np.mean(np.abs(fc - test_data)/np.abs(test_data))
-        print('MAPE: '+str(mape))
+        if evaluate:
+            mse = mean_squared_error(test_data, fc)
+            print('MSE: '+str(mse))
+            mae = mean_absolute_error(test_data, fc)
+            print('MAE: '+str(mae))
+            rmse = math.sqrt(mean_squared_error(test_data, fc))
+            print('RMSE: '+str(rmse))
+            mape = np.mean(np.abs(fc - test_data)/np.abs(test_data))
+            print('MAPE: '+str(mape))
         
-        return model
+            metrics = {"MAE": str(mae),
+                       "MSE": str(mse),
+                       "RMSE": str(rmse),
+                       "MAPE": str(mape),
+                       "Summary": str(fitted.summary())}
+        
+        else:
+            metrics = {}
+            
+        plt.pyplot.close("all")
+        
+        return model, fitted, fc, conf, metrics, priceData
+    
+    
+    
+    
+    def autoARIMA(self, ticker = "", 
+                  confInterval = 0.2, 
+                  savePlt = False, 
+                  evaluate = True, 
+                  predLen = 500, 
+                  plotWindow = 600,
+                  loadFromSave = True,
+                  timestampstr = ""):
+        
+        # https://www.analyticsvidhya.com/blog/2021/07/stock-market-forecasting-using-time-series-analysis-with-arima-model/
+        priceData, t = self.analysis.loadFromDB(tickerList = [ticker],
+                                                indicators = ["MA20"],
+                                                extras = [])
+                
+        priceData = priceData[priceData["ticker_symbol"] == ticker]
+        
+        rcParams['figure.figsize'] = 10, 6
+        df_log = np.log(priceData["adj_close"])
+        
+        if evaluate:
+            train_data, test_data = df_log[0:int(len(df_log)*0.8)], df_log[int(len(df_log)*0.8):]
+        else:
+            train_data = df_log[0:int(len(df_log))]
+            test_data = pd.concat([df_log, pd.Series([np.nan]*predLen)], ignore_index=True)
+        
+        
+        
+        try:
+            if loadFromSave:
+                fileName = "./static/autoARIMA_models/" + ticker + ".pkl"
+                with open(fileName, 'rb') as pkl:
+                    model_autoARIMA = pickle.load(pkl)
+            else:
+                raise ValueError
+                
+        except:
+            model_autoARIMA = auto_arima(train_data, start_p=0, start_q=0,
+                              test='adf',         # use adftest to find optimal 'd'
+                              max_p=10, max_q=10, # maximum p and q
+                              m=1,                # frequency of series
+                              d=None,             # let model determine 'd'
+                              seasonal=False,     # No Seasonality
+                              start_P=0, 
+                              D=0, 
+                              trace=True,
+                              error_action='ignore',  
+                              suppress_warnings=True, 
+                              stepwise=True)
+            
+            fileName = "./static/autoARIMA_models/" + ticker + ".pkl"
+            with open(fileName, 'wb') as pkl:
+                pickle.dump(model_autoARIMA, pkl)
+        
+        
+        print(model_autoARIMA.summary())
+        model_autoARIMA.plot_diagnostics(figsize=(15,8))
+        if savePlt:
+            plt.pyplot.savefig("./static/ARIMA_1_" + timestampstr + ".png")
+        else:
+            plt.pyplot.show()
+        
+        fitted = model_autoARIMA.fit(train_data)
+        
+        fc, conf = fitted.predict(n_periods=predLen, return_conf_int=True, alpha=confInterval)
+        
+        fc = np.exp(fc)
+        conf = np.exp(conf)
+        
+        train_data = np.exp(train_data)
+        test_data = np.exp(test_data)
+        
+        # Make as pandas series
+        fc_series = pd.Series(fc)
+        lower_series = pd.Series(conf[:,0])
+        upper_series = pd.Series(conf[:,1])
+        
+        indSeries = pd.Series(list(range(len(train_data),len(train_data) + predLen)))
+        
+        fc_series = pd.concat([fc_series, indSeries], axis = 1, ignore_index=True)
+        lower_series = pd.concat([lower_series, indSeries], axis = 1, ignore_index=True)
+        upper_series = pd.concat([upper_series, indSeries], axis = 1, ignore_index=True)
+        
+        fc_series.columns = ["mean_pred", "ind"]
+        lower_series.columns = ["lower_conf", "ind"]
+        upper_series.columns = ["upper_conf", "ind"]
+        
+        fc_series.set_index(["ind"], inplace = True)
+        lower_series.set_index(["ind"], inplace = True)
+        upper_series.set_index(["ind"], inplace = True)
+        
+        # Plot
+        plt.pyplot.figure(figsize=(10,5), dpi=100)
+        plt.pyplot.plot(train_data, label='training data')
+        plt.pyplot.plot(test_data, color = 'blue', label='Actual Stock Price')
+        plt.pyplot.plot(fc_series, color = 'orange',label='Predicted Stock Price')
+        plt.pyplot.fill_between(lower_series.index, lower_series["lower_conf"], upper_series["upper_conf"], 
+                          color='k', alpha=.10)
+        plt.pyplot.title(ticker)
+        plt.pyplot.xlabel('Time')
+        plt.pyplot.ylabel(ticker  + ' Stock Price')
+        plt.pyplot.legend(loc='upper left', fontsize=8)
+        plt.pyplot.xlim([len(priceData)-plotWindow, len(priceData) + predLen])
+        if savePlt:
+            plt.pyplot.savefig("./static/ARIMA_2_" + timestampstr + ".png")
+        else:
+            plt.pyplot.show()
+        
+        if evaluate:
+            mse = mean_squared_error(test_data, fc)
+            print('MSE: '+str(mse))
+            mae = mean_absolute_error(test_data, fc)
+            print('MAE: '+str(mae))
+            rmse = math.sqrt(mean_squared_error(test_data, fc))
+            print('RMSE: '+str(rmse))
+            mape = np.mean(np.abs(fc - test_data)/np.abs(test_data))
+            print('MAPE: '+str(mape))
+        
+            metrics = {"MAE": str(mae),
+                       "MSE": str(mse),
+                       "RMSE": str(rmse),
+                       "MAPE": str(mape),
+                       "Summary": str(fitted.summary())}
+        
+        else:
+            metrics = {}
+            
+        endData = pd.concat([fc_series["mean_pred"], lower_series["lower_conf"], 
+                             upper_series["upper_conf"], priceData["adj_close"]], axis = 1)
+        plt.pyplot.close("all")
+        
+        return model_autoARIMA, fitted, endData, metrics
+    
         
         
         
@@ -665,16 +957,14 @@ if __name__ == "__main__":
                                           minDailyVolume = 5000000)
     
     
-    # tree = mod.Trees("A")
-    # lr_model = mod.linearRegression("A")
-    # arima_model = mod.ARIMA("A")
-    
-    
-    # mod.LSTM_train(EpochsPerTicker = 1, fullItterations = 16)
-    data = mod.LSTM_load()
+    mod.LSTM_train(EpochsPerTicker = 20, fullItterations = 10, loadPrevious = False, look_back = 250)
+    # data = mod.LSTM_load()
+    # prediction, evaluation, testX, [testYr, testYc] = mod.LSTM_eval(ticker = "TSLA", evaluate = False)
     # lstm_pred = mod.LSTM_test()
     
-    
+    # tree, endData, mets = mod.Trees("A", savePlt=True, evaluate = False)
+    # lr_model = mod.linearRegression("A")
+    # model_autoARIMA, fitted, endData = mod.autoARIMA("TSLA", evaluate=False, predLen=100, loadFromSave = False)
     
     
     
