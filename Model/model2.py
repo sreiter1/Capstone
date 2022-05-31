@@ -139,9 +139,9 @@ class MLmodels:
     def LSTM_eval(self, ticker = "",
                   savePlt = False, 
                   evaluate = True, 
-                  predLen = 100, 
                   plotWindow = 600,
-                  timestampstr = ""):
+                  timestampstr = "",
+                  predLen = 30):
         
         assert hasattr(self, "lstm_model"), "LSTM Model missing.  Train a new model with LSTM_train() or load a model with LSTM_load()."        
         
@@ -151,7 +151,8 @@ class MLmodels:
             trainSize = 0.9
         
         trainX, trainYr, trainYc, testX, testYr, testYc = self.getLSTMTestTrainData(ticker = ticker, 
-                                                                                    trainSize = trainSize)
+                                                                                    trainSize = trainSize,
+                                                                                    predLen = predLen)
         
         
         evaluation = self.lstm_model.evaluate(testX, [testYr, testYc])
@@ -172,7 +173,8 @@ class MLmodels:
                    randomSeed = int(time.time()*100 % (2**32-1)), 
                    trainSize = -1, 
                    trainDate = "01-01-2020",
-                   loadPrevious = True):
+                   loadPrevious = True,
+                   predLen = 30):
         
         np.random.seed(randomSeed)
         
@@ -198,7 +200,7 @@ class MLmodels:
         else:
             self.createLSTMNetwork(look_back = look_back)
             prevItter = 0
-            folderName = "./LSTM/" + str(startTime.replace(microsecond=0)) + "/"
+            folderName = "./static/LSTMmodels/" + str(startTime.replace(microsecond=0)) + "/"
             folderName = folderName.replace(":", ".")
             os.makedirs(folderName)
             saveString = folderName + "training_data.csv"
@@ -322,7 +324,7 @@ class MLmodels:
     
     
     
-    def createLSTMNetwork(self, look_back):
+    def createLSTMNetwork(self, look_back, predLen = 30):
         # Model 1:
         # inLayer = Input(shape = (look_back, 7))
         # hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
@@ -337,13 +339,14 @@ class MLmodels:
         
         
         # Model 2
-        inLayer = Input(shape = (look_back, 7))
-        hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
-        hidden2 = Dense(128, name='dense1',  activation = "relu"   )(hidden1)
-        outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden2)
-        outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden2)
+        inLayer     = Input(shape = (look_back, 7))
+        hidden1     = LSTM(120,      name='LSTM',    activation = "sigmoid")(inLayer)
+        hidden2     = Dense(128,     name='dense1',  activation = "relu"   )(hidden1)
+        outRegHigh  = Dense(predLen, name='out_reg_h', activation = "linear" )(hidden2)
+        outRegLow   = Dense(predLen, name='out_reg_l', activation = "linear" )(hidden2)
+        outCat      = Dense(predLen, name='out_cat', activation = "softmax")(hidden2)
         
-        self.lstm_model = Model(inputs=inLayer, outputs=[outReg, outCat])
+        self.lstm_model = Model(inputs=inLayer, outputs=[outRegHigh, outRegLow, outCat])
         self.compileLSTM()
         
         print("---LSTM model built---\n")
@@ -355,17 +358,19 @@ class MLmodels:
     def compileLSTM(self):
         opt = optimizers.Adam(learning_rate = 0.05)
         self.lstm_model.compile(optimizer = opt,
-                                loss = {"out_reg" : "mean_squared_error", 
-                                        "out_cat" : "categorical_crossentropy"},
-                                metrics = {"out_reg": [metrics.MeanSquaredError(name = "mse"), 
-                                                       metrics.MeanAbsolutePercentageError(name = "mape")],
+                                loss = {"out_reg_h" : "mean_squared_error", 
+                                        "out_reg_l" : "mean_squared_error",
+                                        "out_cat"   : "binary_crossentropy"},
+                                metrics = {"out_reg_h": [metrics.MeanSquaredError(name = "mse"), 
+                                                         metrics.MeanAbsolutePercentageError(name = "mape")],
+                                           "out_reg_l": [metrics.MeanSquaredError(name = "mse"), 
+                                                         metrics.MeanAbsolutePercentageError(name = "mape")],
                                            "out_cat": [metrics.AUC(name = "auc"),
                                                        metrics.CategoricalAccuracy(name = "catAcc"), 
                                                        metrics.TruePositives(name = "TP"),
                                                        metrics.TrueNegatives(name = "TN"),
                                                        metrics.FalsePositives(name = "FP"),
-                                                       metrics.FalseNegatives(name = "FN")]},
-                                loss_weights = {"out_reg": 1.0, "out_cat": 5.0})
+                                                       metrics.FalseNegatives(name = "FN")]})
     
     
     
@@ -381,11 +386,17 @@ class MLmodels:
     
     
     
-    def splitLSTMData(self, inputs, outputs_r, outputs_c, look_back = 200, trainSize = 0.8):
+    def splitLSTMData(self, inputs, 
+                      outputs_rh,  
+                      outputs_rl,
+                      outputs_c, 
+                      look_back = 120, 
+                      trainSize = 0.8, 
+                      predLen = 30):
         # takes 2D np array of data with axes of time (i.e. trading days) and features,
         # and returns a 3D np array of batch, time, features
         
-        dataX, dataY_r, dataY_c = [], [], []
+        dataX, dataY_rh, dataY_rl, dataY_c = [], [], [], []
         lenInput = len(inputs)
         
         
@@ -399,22 +410,29 @@ class MLmodels:
             raise ValueError("test size < 0; this is not valid.")
             
             
-        for i in range(lenInput - look_back - 1):
-            a = inputs[i:(i+look_back)]
+        for i in range(lenInput - look_back - predLen):
+            a = inputs[i : (i+look_back)]
+            b = outputs_rh[(i + look_back) : (i + look_back + predLen)]
+            c = outputs_rl[(i + look_back) : (i + look_back + predLen)]
+            d = outputs_c[(i + look_back) : (i + look_back + predLen)]
+            
             dataX.append(a)
-            dataY_r.append(outputs_r[i + look_back])
-            dataY_c.append(outputs_c[i + look_back])
+            dataY_rh.append(b)
+            dataY_rl.append(c)
+            dataY_c.append(d)
             
         
-        trainX = np.array(dataX[:lenTrain])
-        trainYr = np.array(dataY_r[:lenTrain])
-        trainYc = np.array(dataY_c[:lenTrain])
+        trainX   = np.array(dataX[:lenTrain])
+        trainYrh = np.array(dataY_rh[:lenTrain])
+        trainYrl = np.array(dataY_rl[:lenTrain])
+        trainYc  = np.array(dataY_c[:lenTrain])
         
-        testX = np.array(dataX[(lenTrain+1):])
-        testYr = np.array(dataY_r[(lenTrain+1):])
-        testYc = np.array(dataY_c[(lenTrain+1):])
+        testX   = np.array(dataX[(lenTrain+1):])
+        testYrh = np.array(dataY_rh[(lenTrain+1):])
+        testYrl = np.array(dataY_rl[(lenTrain+1):])
+        testYc  = np.array(dataY_c[(lenTrain+1):])
         
-        return trainX, trainYr, trainYc, testX, testYr, testYc
+        return trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc
     
     
     
@@ -423,7 +441,8 @@ class MLmodels:
                              look_back = 120,
                              ticker = "", 
                              trainSize = -1, 
-                             trainDate = "01-01-2020"):
+                             trainDate = "01-01-2020",
+                             predLen = 30):
         
         loadedData, t = self.analysis.loadFromDB(tickerList = [ticker],
                                                  indicators = ["MA20", "OBV", "IDEAL"],
@@ -464,6 +483,18 @@ class MLmodels:
         outputFrame["low" ] = loadedData["ideal_low" ]
         outputFrame["trig"] = [1 if t==1 else 0 for t in loadedData["ideal_return_trig"]]
         
+    
+        # reshape / modify the inputs and outputs to match the LSTM expectations
+        # and separeate into test and train sets
+        trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc =    \
+                                                            self.splitLSTMData(inputFrame.to_numpy(), 
+                                                            outputFrame["high"].to_numpy().reshape(-1,1),
+                                                            outputFrame["low" ].to_numpy().reshape(-1,1),
+                                                            outputFrame["trig"].to_numpy().reshape(-1,1), 
+                                                            look_back = look_back, 
+                                                            trainSize = trainLen,
+                                                            predLen = 30)
+        
         
         # ----------------------------------------------
         # scale the inputs and outputs.  Pricing data is separated from the OBV data
@@ -472,37 +503,57 @@ class MLmodels:
         # ----------------------------------------------
         
         # create scalers for the data
-        inPriceNorm  = MinMaxScaler()
-        inOBVNorm    = MinMaxScaler()
-        inVolNorm    = MinMaxScaler()
-        outPriceNorm = MinMaxScaler()
+        minMax  = MinMaxScaler()
+    
+        for i in range(len(trainX)):
+            # track progress:
+            print("\rProcessing Training: (" + str('=' * int(20*i/len(trainX) + 1)).ljust(20) + ")    ", end = "")
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the trigger data.
+            fitList = self.getFitArray(max(trainX[i,:,1]), min(trainX[i,:,2]), 1)
+            minMax.fit(fitList)
+            trainYrh[i,:,0] = minMax.transform(trainYrh[i,:,0].reshape(-1,1)).flatten()
+            trainYrl[i,:,0] = minMax.transform(trainYrl[i,:,0].reshape(-1,1)).flatten()
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the OBV data.
+            fitList = self.getFitArray(max(trainX[i,:,1]), min(trainX[i,:,2]), 5)  #should small (min) be 0?  or min('low')?
+            minMax.fit(fitList)
+            trainX[i,:,:5] = minMax.transform(trainX[i,:,:5])
+            trainX[i,:, 5] = minMax.fit_transform(trainX[i,:,5].reshape(-1,1)).flatten()
+            trainX[i,:, 6] = minMax.fit_transform(trainX[i,:, 6].reshape(-1,1)).flatten()
+            
         
-        # get the fit data to match the highest high and lowest low so
-        # that all the pricing data is scaled together (relationships between 
-        # features should be maintained).  Then append the OBV data.
-        fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 5)  #should small (min) be 0?  or min('low')?
-        inPriceNorm.fit(fitList)
-        inputs_norm  = inPriceNorm.transform(inputFrame[["open", "high", "low", "close", "ma20"]])
-        inputs_norm  = np.concatenate((inputs_norm, inOBVNorm.fit_transform(inputFrame[["obv"]]).reshape(-1,1)), axis = 1)
-        inputs_norm  = np.concatenate((inputs_norm, inVolNorm.fit_transform(inputFrame[["vol"]]).reshape(-1,1)), axis = 1)
         
         
-        # get the fit data to match the highest high and lowest low so
-        # that all the pricing data is scaled together (relationships between 
-        # features should be maintained).  Then append the trigger data.
-        fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 2)
-        outPriceNorm.fit(fitList)
-        outputs_reg = outPriceNorm.transform(outputFrame[["high", "low"]])
-        outputs_cat = OneHotEncoder(sparse = False).fit_transform(outputFrame["trig"].to_numpy().reshape(-1,1))
+        print()
+        for i in range(len(testX)):
+            # track progress:
+            print("\rProcessing Testing:  (" + str('=' * int(20*i/len(testX) + 1)).ljust(20) + ")    ", end = "")
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the trigger data.
+            fitList = self.getFitArray(max(testX[i,:,1]), min(testX[i,:,2]), 1)
+            minMax.fit(fitList)
+            testYrh[i,:,0] = minMax.transform(testYrh[i,:,0].reshape(-1,1)).flatten()
+            testYrl[i,:,0] = minMax.transform(testYrl[i,:,0].reshape(-1,1)).flatten()
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the OBV data.
+            fitList = self.getFitArray(max(testX[i,:,1]), min(testX[i,:,2]), 5)  #should small (min) be 0?  or min('low')?
+            minMax.fit(fitList)
+            testX[i,:,:5] = minMax.transform(testX[i,:,:5])
+            testX[i,:, 5] = minMax.fit_transform(testX[i,:,5].reshape(-1,1)).flatten()
+            testX[i,:, 6] = minMax.fit_transform(testX[i,:,6].reshape(-1,1)).flatten()
         
-        # modify the inputs and outputs to match the LSTM expectations
-        # and separeate into test and train sets
-        trainX, trainYr, trainYc, testX, testYr, testYc = self.splitLSTMData(inputs_norm, outputs_reg, outputs_cat, look_back = look_back, trainSize = trainLen)
-        self.testX_out.append(testX)
-        self.testYr_out.append(testYr)
-        self.testYc_out.append(testYc)
         
-        return trainX, trainYr, trainYc, testX, testYr, testYc
+        print()
+        return trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc
     
     
     
@@ -599,7 +650,6 @@ class MLmodels:
         
         return tree, endData, mets
         
-    
     
     
     
@@ -957,7 +1007,12 @@ if __name__ == "__main__":
                                           minDailyVolume = 5000000)
     
     
-    mod.LSTM_train(EpochsPerTicker = 20, fullItterations = 10, loadPrevious = False, look_back = 250)
+    # mod.LSTM_train(EpochsPerTicker = 20, 
+    #                fullItterations = 10, 
+    #                loadPrevious = False, 
+    #                look_back = 250, 
+    #                trainSize = 0.8)
+    
     # data = mod.LSTM_load()
     # prediction, evaluation, testX, [testYr, testYc] = mod.LSTM_eval(ticker = "TSLA", evaluate = False)
     # lstm_pred = mod.LSTM_test()
