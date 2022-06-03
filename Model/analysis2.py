@@ -707,10 +707,8 @@ class analysis:
 
 if __name__ == "__main__":
     ana = analysis()
-    data = ana.filterStocksFromDataBase(dailyLength = 1250, 
-                                        maxDailyChange = 50, 
-                                        minDailyChange = -50, 
-                                        minDailyVolume = 500000)
+    data = ana.filterStocksFromDataBase(dailyLength = 1, 
+                                        minDailyVolume = 1)
     
     print("Number of stocks selected:  " + str(len(ana._tickerList)) + ".             ")
     

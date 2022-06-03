@@ -1030,12 +1030,17 @@ if __name__ == "__main__":
                                           minDailyVolume = 5000000)
     
     
-    mod.LSTM_train(EpochsPerTicker = 20, 
-                   fullItterations = 10, 
-                   loadPrevious = False,
-                   look_back = 250, 
-                   trainSize = 0.9)
+    # mod.LSTM_train(EpochsPerTicker = 20, 
+    #                 fullItterations = 10, 
+    #                 loadPrevious = False,
+    #                 look_back = 250, 
+    #                 trainSize = 0.9,
+    #                 predLen = 30)
     
+    data = mod.getLSTMTestTrainData(ticker = "A",
+                                    look_back=250,
+                                    trainSize=0.9,
+                                    predLen = 30)
     
     # data = mod.LSTM_load()
     # prediction, evaluation, testX, [testYr, testYc] = mod.LSTM_eval(ticker = "TSLA", evaluate = False)
