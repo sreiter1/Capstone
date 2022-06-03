@@ -10,7 +10,7 @@ import pandas as pd
 import matplotlib as plt
 import warnings
 import commonUtilities
-import analysis2
+import analysis
 import IndicatorsAndFilters
 import StockData
 import pickle
@@ -18,7 +18,6 @@ import pickle
 import datetime as dt
 import os
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.preprocessing import OneHotEncoder
 import time
 
 import math
@@ -46,6 +45,14 @@ from pylab import rcParams
 
 warnings.filterwarnings('ignore')
 
+
+class noPriceData(Exception):
+    # raised when the program detects that the call limit was exceeded, 
+    # either because the limit set in 'getData' is exceeded or if the API 
+    # returns a specific error.
+    pass
+
+
     
     
 
@@ -71,7 +78,7 @@ class MLmodels:
         
         self.indicatorList = commonUtilities.conversionTables.indicatorList
         
-        self.analysis   = analysis2.analysis(dataBaseSaveFile = dataBaseSaveFile, 
+        self.analysis   = analysis.analysis(dataBaseSaveFile = dataBaseSaveFile, 
                                              dataBaseThreadCheck = dataBaseThreadCheck)
         self.indicators = IndicatorsAndFilters.filterData(dataBaseSaveFile = dataBaseSaveFile, 
                                                           dataBaseThreadCheck = dataBaseThreadCheck)
@@ -127,11 +134,20 @@ class MLmodels:
         
         print("Loading file: " + self.prevTrainingData)
         try: 
-            trainHist = pd.read_csv(self.prevTrainingData, header = 13)
+            f = open(self.prevTrainingData, "r")
+            readfile = f.read()
+            f.close()
+            
+            look_back = readfile.split("\n")[1]
+            look_back = int(look_back.split(" = ")[1].split(",")[0])
+            predLen = readfile.split("\n")[2]
+            predLen = int(predLen.split(" = ")[1].split(",")[0])
+            
+            trainHist = pd.read_csv(self.prevTrainingData, header = 15)
         except:
             print("Failed to load previous training data.  Check ./LSTM/ to verify that training_data.csv is present.")
         
-        return trainHist
+        return trainHist, look_back, predLen
     
     
     
@@ -139,9 +155,11 @@ class MLmodels:
     def LSTM_eval(self, ticker = "",
                   savePlt = False, 
                   evaluate = True, 
-                  predLen = 100, 
                   plotWindow = 600,
-                  timestampstr = ""):
+                  timestampstr = "",
+                  predLen = 30,
+                  look_back = 120,
+                  trainDate = "01-01-2020"):
         
         assert hasattr(self, "lstm_model"), "LSTM Model missing.  Train a new model with LSTM_train() or load a model with LSTM_load()."        
         
@@ -150,17 +168,22 @@ class MLmodels:
         else:
             trainSize = 0.9
         
-        trainX, trainYr, trainYc, testX, testYr, testYc = self.getLSTMTestTrainData(ticker = ticker, 
-                                                                                    trainSize = trainSize)
+        try:
+            trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc = \
+                                self.getLSTMTestTrainData(look_back = look_back,
+                                                          ticker = ticker, 
+                                                          trainSize = trainSize, 
+                                                          trainDate = trainDate,
+                                                          predLen = predLen)
+        except (noPriceData):
+            print("\nNo Data associated with ticker '" + ticker + "'.")
+            return None, None, None, [None, None, None]
         
         
-        evaluation = self.lstm_model.evaluate(testX, [testYr, testYc])
-        
-        
+        evaluation = self.lstm_model.evaluate(testX, [trainYrh, trainYrl, testYc])
         prediction = self.lstm_model.predict(testX)
         
-        
-        return prediction, evaluation, testX, [testYr, testYc]
+        return prediction, evaluation, testX, [trainYrh, trainYrl, testYc]
     
     
     
@@ -172,38 +195,45 @@ class MLmodels:
                    randomSeed = int(time.time()*100 % (2**32-1)), 
                    trainSize = -1, 
                    trainDate = "01-01-2020",
-                   loadPrevious = True):
+                   loadPrevious = True,
+                   predLen = 30,
+                   storeTrainingDataInRAM = False):
         
         np.random.seed(randomSeed)
+        trainingData = {}
         
         startTime = dt.datetime.now()
         self.trainingTimes   = []
         self.trainingHistory = []
         self.testingHistory  = []
-        trainHistKeys = ['learn_rate', 'val_loss', 'val_out_reg_loss', 'val_out_cat_loss', 
-                         'val_out_reg_mse', 'val_out_reg_mape', 'val_out_cat_auc', 
+        trainHistKeys = ['val_loss', 'val_out_reg_h_loss', 'val_out_reg_l_loss', 
+                         'val_out_cat_loss', 'val_out_reg_h_mse', 'val_out_reg_h_mape', 
+                         'val_out_reg_l_mse', 'val_out_reg_l_mape', 'val_out_cat_auc', 
                          'val_out_cat_catAcc', 'val_out_cat_TP', 'val_out_cat_TN', 
-                         'val_out_cat_FP', 'val_out_cat_FN', 'loss', 'out_reg_loss', 
-                         'out_cat_loss', 'out_reg_mse', 'out_reg_mape', 'out_cat_auc', 
-                         'out_cat_catAcc', 'out_cat_TP', 'out_cat_TN', 'out_cat_FP', 
-                         'out_cat_FN']
+                         'val_out_cat_FP', 'val_out_cat_FN', 'loss', 'out_reg_h_loss', 
+                         'out_reg_l_loss', 'out_cat_loss', 'out_reg_h_mse', 
+                         'out_reg_h_mape', 'out_reg_l_mse', 'out_reg_l_mape', 
+                         'out_cat_auc', 'out_cat_catAcc', 'out_cat_TP', 'out_cat_TN', 
+                         'out_cat_FP', 'out_cat_FN']
         
         
         # Save file for the training data
         if loadPrevious:
-            self.LSTM_load()
+            trainHist, look_back, predLen = self.LSTM_load()
             prevItter = int(self.modelToLoad.split("_")[-1].split(".")[0])
             dataFile  = open(self.prevTrainingData, 'a')
             folderName = "\\".join(self.prevTrainingData.split("\\")[:-1]) + "\\"
         else:
             self.createLSTMNetwork(look_back = look_back)
             prevItter = 0
-            folderName = "./LSTM/" + str(startTime.replace(microsecond=0)) + "/"
+            folderName = "./static/LSTMmodels/" + str(startTime.replace(microsecond=0)) + "/"
             folderName = folderName.replace(":", ".")
             os.makedirs(folderName)
             saveString = folderName + "training_data.csv"
             dataFile = open(saveString, 'w')
             dataFile.write("Saved Metrics:\n"
+                           "Look Back = " + str(look_back) + "\n"
+                           "Prediction Length = " + str(predLen) + "\n"
                            "MeanSquaredError = 'mse'\n" + 
                            "MeanAbsolutePercentageError = 'mape'\n" + 
                            "AUC = 'auc'\n" + 
@@ -220,8 +250,8 @@ class MLmodels:
             dataFile.write(",,,training performance\nticker,itteration,run time,") 
             for key in trainHistKeys:
                 dataFile.write(key + ",")
-            dataFile.write("\n")
-            dataFile.flush()
+            dataFile.write("learning_rate\n")    
+            dataFile.close()
             
         
         
@@ -229,11 +259,12 @@ class MLmodels:
             tickerList = self.analysis._tickerList
             
         if tickerList == []:
+            print("\nLoading default ticker data...\n")
             self.analysis.filterStocksFromDataBase(dailyLength = 1250, 
                                                     maxDailyChange = 50, 
                                                     minDailyChange = -50, 
                                                     minDailyVolume = 500000)
-            tickerList = ["ZNGA"] # self.analysis._tickerList
+        
         
         print(str(len(tickerList)).rjust(6) + "  Tickers selected by the filter.             ")
         
@@ -244,9 +275,9 @@ class MLmodels:
         short_model_summary = "\n".join(stringlist)
         
         if not loadPrevious:
-            saveString = folderName + "tickerList - " + str(len(tickerList)) + ".txt"
-            saveString = saveString.replace(":", ".")
-            tickerFile = open(saveString, 'w')
+            tickString = folderName + "tickerList - " + str(len(tickerList)) + ".txt"
+            tickString = tickString.replace(":", ".")
+            tickerFile = open(tickString, 'w')
             tickerFile.write(short_model_summary)
             tickerFile.write("\n\n-------------------------------------\n\n\nTickers included for training:\n\n")
             tickerFile.write(str(tickerList))
@@ -261,10 +292,29 @@ class MLmodels:
             for ticker in tickerList:
                 tickerCounter += 1
                 
-                trainX, trainYr, trainYc, testX, testYr, testYc = self.getLSTMTestTrainData(look_back = look_back,
-                                                                                            ticker = ticker, 
-                                                                                            trainSize = trainSize, 
-                                                                                            trainDate = trainDate)
+                
+                print(trainDate)
+                
+                
+                if ticker in trainingData.keys():
+                    trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc = trainingData[ticker]
+                else:
+                    try:
+                        trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc = \
+                                    self.getLSTMTestTrainData(look_back = look_back,
+                                                              ticker = ticker, 
+                                                              trainSize = trainSize, 
+                                                              trainDate = trainDate,
+                                                              predLen = predLen)
+                        
+                        if storeTrainingDataInRAM:
+                            trainingData[ticker] = (trainX, trainYrh, trainYrl, trainYc, 
+                                                    testX, testYrh, testYrl, testYc)
+                        
+                    except (noPriceData):
+                        print("\nNo Data associated with ticker '" + ticker + "'.")
+                        continue
+                
                 
                 print("\nTraining on " + ticker.rjust(6) + "  (" + str(tickerCounter) + " of " + tickerTotal \
                       + "),  Itteration (" + str(itteration + 1) + " of " + str(fullItterations) \
@@ -276,16 +326,18 @@ class MLmodels:
                 # Train the model
                 
                 self.lstm_model.reset_states()
-                trainHist = self.lstm_model.fit(trainX, [trainYr, trainYc], 
+                
+                trainHist = self.lstm_model.fit(trainX, [trainYrh, trainYrl, trainYc], 
                                                 epochs = EpochsPerTicker, 
                                                 verbose = 1, 
-                                                validation_split = 0.2)
+                                                validation_split = 0.125)
                 
                 #--------------------------------------------------
                 # store the training information in memory
                 
                 self.trainingHistory.append( [ticker, itteration, trainHist.history]  )
                 self.trainingTimes.append(   [ticker, itteration, dt.datetime.now()]  )
+                
                 
                 #--------------------------------------------------
                 # store the training information to disk
@@ -297,15 +349,17 @@ class MLmodels:
                                      str(dt.datetime.now()) + ","
                     else:
                         dataString += ",,,"
-                        
+                    
+                    
                     for key in trainHistKeys:
                         dataString += str(trainHist.history[key][i]) + ","
-                        
-                    dataString = dataString[:-1] + "\n"
-                        
+                    
+                    dataString += str(mod.lstm_model.optimizer.lr.value).split("numpy=")[1].split(">>")[0] + "\n"
+                    
                 
+                dataFile = open(saveString, 'a')
                 dataFile.write(dataString)
-                dataFile.flush()
+                dataFile.close()
                 
             
             #--------------------------------------------------
@@ -322,7 +376,8 @@ class MLmodels:
     
     
     
-    def createLSTMNetwork(self, look_back):
+    
+    def createLSTMNetwork(self, look_back, predLen = 30):
         # Model 1:
         # inLayer = Input(shape = (look_back, 7))
         # hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
@@ -337,13 +392,14 @@ class MLmodels:
         
         
         # Model 2
-        inLayer = Input(shape = (look_back, 7))
-        hidden1 = LSTM(120,  name='LSTM',    activation = "sigmoid")(inLayer)
-        hidden2 = Dense(128, name='dense1',  activation = "relu"   )(hidden1)
-        outReg  = Dense(2,   name='out_reg', activation = "linear" )(hidden2)
-        outCat  = Dense(2,   name='out_cat', activation = "softmax")(hidden2)
+        inLayer     = Input(shape = (look_back, 7))
+        hidden1     = LSTM(120,      name='LSTM',    activation = "sigmoid")(inLayer)
+        hidden2     = Dense(128,     name='dense1',  activation = "relu"   )(hidden1)
+        outRegHigh  = Dense(predLen, name='out_reg_h', activation = "linear" )(hidden2)
+        outRegLow   = Dense(predLen, name='out_reg_l', activation = "linear" )(hidden2)
+        outCat      = Dense(predLen, name='out_cat', activation = "softmax")(hidden2)
         
-        self.lstm_model = Model(inputs=inLayer, outputs=[outReg, outCat])
+        self.lstm_model = Model(inputs=inLayer, outputs=[outRegHigh, outRegLow, outCat])
         self.compileLSTM()
         
         print("---LSTM model built---\n")
@@ -355,17 +411,19 @@ class MLmodels:
     def compileLSTM(self):
         opt = optimizers.Adam(learning_rate = 0.05)
         self.lstm_model.compile(optimizer = opt,
-                                loss = {"out_reg" : "mean_squared_error", 
-                                        "out_cat" : "categorical_crossentropy"},
-                                metrics = {"out_reg": [metrics.MeanSquaredError(name = "mse"), 
-                                                       metrics.MeanAbsolutePercentageError(name = "mape")],
+                                loss = {"out_reg_h" : "mean_squared_error", 
+                                        "out_reg_l" : "mean_squared_error",
+                                        "out_cat"   : "binary_crossentropy"},
+                                metrics = {"out_reg_h": [metrics.MeanSquaredError(name = "mse"), 
+                                                         metrics.MeanAbsolutePercentageError(name = "mape")],
+                                           "out_reg_l": [metrics.MeanSquaredError(name = "mse"), 
+                                                         metrics.MeanAbsolutePercentageError(name = "mape")],
                                            "out_cat": [metrics.AUC(name = "auc"),
                                                        metrics.CategoricalAccuracy(name = "catAcc"), 
                                                        metrics.TruePositives(name = "TP"),
                                                        metrics.TrueNegatives(name = "TN"),
                                                        metrics.FalsePositives(name = "FP"),
-                                                       metrics.FalseNegatives(name = "FN")]},
-                                loss_weights = {"out_reg": 1.0, "out_cat": 5.0})
+                                                       metrics.FalseNegatives(name = "FN")]})
     
     
     
@@ -381,15 +439,21 @@ class MLmodels:
     
     
     
-    def splitLSTMData(self, inputs, outputs_r, outputs_c, look_back = 200, trainSize = 0.8):
+    def splitLSTMData(self, inputs, 
+                      outputs_rh,  
+                      outputs_rl,
+                      outputs_c, 
+                      look_back = 120, 
+                      trainSize = 0.8, 
+                      predLen = 30):
         # takes 2D np array of data with axes of time (i.e. trading days) and features,
         # and returns a 3D np array of batch, time, features
         
-        dataX, dataY_r, dataY_c = [], [], []
+        dataX, dataY_rh, dataY_rl, dataY_c = [], [], [], []
         lenInput = len(inputs)
         
         
-        if trainSize < 1 and trainSize > 0:
+        if trainSize <= 1 and trainSize > 0:
             lenTrain = int(lenInput * trainSize)
             if trainSize < 0.5:
                 warnings.warn("testSize is declared to be less than half of the dataset; results may not be useful.")
@@ -399,22 +463,29 @@ class MLmodels:
             raise ValueError("test size < 0; this is not valid.")
             
             
-        for i in range(lenInput - look_back - 1):
-            a = inputs[i:(i+look_back)]
+        for i in range(lenInput - look_back - predLen):
+            a = inputs[i : (i+look_back)]
+            b = outputs_rh[(i + look_back) : (i + look_back + predLen)]
+            c = outputs_rl[(i + look_back) : (i + look_back + predLen)]
+            d = outputs_c[(i + look_back) : (i + look_back + predLen)]
+            
             dataX.append(a)
-            dataY_r.append(outputs_r[i + look_back])
-            dataY_c.append(outputs_c[i + look_back])
+            dataY_rh.append(b)
+            dataY_rl.append(c)
+            dataY_c.append(d)
             
         
-        trainX = np.array(dataX[:lenTrain])
-        trainYr = np.array(dataY_r[:lenTrain])
-        trainYc = np.array(dataY_c[:lenTrain])
+        trainX   = np.array(dataX[:lenTrain])
+        trainYrh = np.array(dataY_rh[:lenTrain])
+        trainYrl = np.array(dataY_rl[:lenTrain])
+        trainYc  = np.array(dataY_c[:lenTrain])
         
-        testX = np.array(dataX[(lenTrain+1):])
-        testYr = np.array(dataY_r[(lenTrain+1):])
-        testYc = np.array(dataY_c[(lenTrain+1):])
+        testX   = np.array(dataX[(lenTrain+1):])
+        testYrh = np.array(dataY_rh[(lenTrain+1):])
+        testYrl = np.array(dataY_rl[(lenTrain+1):])
+        testYc  = np.array(dataY_c[(lenTrain+1):])
         
-        return trainX, trainYr, trainYc, testX, testYr, testYc
+        return trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc
     
     
     
@@ -423,12 +494,17 @@ class MLmodels:
                              look_back = 120,
                              ticker = "", 
                              trainSize = -1, 
-                             trainDate = "01-01-2020"):
+                             trainDate = "01-01-2020",
+                             predLen = 30):
         
         loadedData, t = self.analysis.loadFromDB(tickerList = [ticker],
                                                  indicators = ["MA20", "OBV", "IDEAL"],
                                                  extras = ["HIGH", "LOW", "ADJRATIO", "VOLUME",
                                                            "IDEAL_HIGH", "IDEAL_LOW", "IDEAL_TRIG"])
+        
+        if len(loadedData) == 0:
+            raise noPriceData("No Price Data associated with ticker '" + ticker + "'.")
+            
         
         loadedData['recordDate'] = pd.to_datetime(loadedData['recordDate'])
         loadedData.sort_values(by = ["ticker_symbol", "recordDate"], ascending=True, inplace=True)
@@ -437,11 +513,11 @@ class MLmodels:
         if trainSize == -1:
             trainLen = len(loadedData.loc[loadedData["recordDate"] < pd.to_datetime(trainDate)])
         elif 0 < trainSize and trainSize <= 1:
-            trainLen = int(trainSize * len(loadedData["recordDate"]))
+            trainLen = int(trainSize * (len(loadedData["recordDate"]) - look_back))
         elif trainSize > 1:
-            trainLen = min(int(trainSize), len(loadedData["recordDate"]-1))
+            trainLen = min(int(trainSize), len(loadedData["recordDate"] - 1))
         else:
-            trainLen = int(0.8 * len(loadedData["recordDate"]))
+            trainLen = int(0.8 * (len(loadedData["recordDate"]) - look_back))
             
         
         # ensure that the adjustment ratio does not cause a div-by-0 error
@@ -464,6 +540,18 @@ class MLmodels:
         outputFrame["low" ] = loadedData["ideal_low" ]
         outputFrame["trig"] = [1 if t==1 else 0 for t in loadedData["ideal_return_trig"]]
         
+    
+        # reshape / modify the inputs and outputs to match the LSTM expectations
+        # and separeate into test and train sets
+        trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc =    \
+                                                            self.splitLSTMData(inputFrame.to_numpy(), 
+                                                            outputFrame["high"].to_numpy().reshape(-1,1),
+                                                            outputFrame["low" ].to_numpy().reshape(-1,1),
+                                                            outputFrame["trig"].to_numpy().reshape(-1,1), 
+                                                            look_back = look_back, 
+                                                            trainSize = trainLen,
+                                                            predLen = predLen)
+        
         
         # ----------------------------------------------
         # scale the inputs and outputs.  Pricing data is separated from the OBV data
@@ -472,37 +560,66 @@ class MLmodels:
         # ----------------------------------------------
         
         # create scalers for the data
-        inPriceNorm  = MinMaxScaler()
-        inOBVNorm    = MinMaxScaler()
-        inVolNorm    = MinMaxScaler()
-        outPriceNorm = MinMaxScaler()
+        minMax  = MinMaxScaler()
+    
+        for i in range(len(trainX)):
+            # track progress:
+            print("\rProcessing Training: (" + str('=' * int(20*i/len(trainX) + 1)).ljust(20) + ")    ", end = "")
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the trigger data.
+            fitList = self.getFitArray(max(trainX[i,:,1]), min(trainX[i,:,2]), 1)
+            minMax.fit(fitList)
+            trainYrh[i,:,0] = minMax.transform(trainYrh[i,:,0].reshape(-1,1)).flatten()
+            trainYrl[i,:,0] = minMax.transform(trainYrl[i,:,0].reshape(-1,1)).flatten()
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the OBV data.
+            fitList = self.getFitArray(max(trainX[i,:,1]), min(trainX[i,:,2]), 5)  #should small (min) be 0?  or min('low')?
+            minMax.fit(fitList)
+            trainX[i,:,:5] = minMax.transform(trainX[i,:,:5])
+            trainX[i,:, 5] = minMax.fit_transform(trainX[i,:,5].reshape(-1,1)).flatten()
+            trainX[i,:, 6] = minMax.fit_transform(trainX[i,:, 6].reshape(-1,1)).flatten()
+            
         
-        # get the fit data to match the highest high and lowest low so
-        # that all the pricing data is scaled together (relationships between 
-        # features should be maintained).  Then append the OBV data.
-        fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 5)  #should small (min) be 0?  or min('low')?
-        inPriceNorm.fit(fitList)
-        inputs_norm  = inPriceNorm.transform(inputFrame[["open", "high", "low", "close", "ma20"]])
-        inputs_norm  = np.concatenate((inputs_norm, inOBVNorm.fit_transform(inputFrame[["obv"]]).reshape(-1,1)), axis = 1)
-        inputs_norm  = np.concatenate((inputs_norm, inVolNorm.fit_transform(inputFrame[["vol"]]).reshape(-1,1)), axis = 1)
         
         
-        # get the fit data to match the highest high and lowest low so
-        # that all the pricing data is scaled together (relationships between 
-        # features should be maintained).  Then append the trigger data.
-        fitList = self.getFitArray(max(inputFrame["high"]), min(inputFrame["low"]), 2)
-        outPriceNorm.fit(fitList)
-        outputs_reg = outPriceNorm.transform(outputFrame[["high", "low"]])
-        outputs_cat = OneHotEncoder(sparse = False).fit_transform(outputFrame["trig"].to_numpy().reshape(-1,1))
+        print()
+        for i in range(len(testX)):
+            # track progress:
+            print("\rProcessing Testing:  (" + str('=' * int(20*i/len(testX) + 1)).ljust(20) + ")    ", end = "")
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the trigger data.
+            fitList = self.getFitArray(max(testX[i,:,1]), min(testX[i,:,2]), 1)
+            minMax.fit(fitList)
+            testYrh[i,:,0] = minMax.transform(testYrh[i,:,0].reshape(-1,1)).flatten()
+            testYrl[i,:,0] = minMax.transform(testYrl[i,:,0].reshape(-1,1)).flatten()
+            
+            # get the fit data to match the highest high and lowest low so
+            # that all the pricing data is scaled together (relationships between 
+            # features should be maintained).  Then append the OBV data.
+            fitList = self.getFitArray(max(testX[i,:,1]), min(testX[i,:,2]), 5)  #should small (min) be 0?  or min('low')?
+            minMax.fit(fitList)
+            testX[i,:,:5] = minMax.transform(testX[i,:,:5])
+            testX[i,:, 5] = minMax.fit_transform(testX[i,:,5].reshape(-1,1)).flatten()
+            testX[i,:, 6] = minMax.fit_transform(testX[i,:,6].reshape(-1,1)).flatten()
         
-        # modify the inputs and outputs to match the LSTM expectations
-        # and separeate into test and train sets
-        trainX, trainYr, trainYc, testX, testYr, testYc = self.splitLSTMData(inputs_norm, outputs_reg, outputs_cat, look_back = look_back, trainSize = trainLen)
-        self.testX_out.append(testX)
-        self.testYr_out.append(testYr)
-        self.testYc_out.append(testYc)
         
-        return trainX, trainYr, trainYc, testX, testYr, testYc
+        print()
+        
+        trainYrh = np.squeeze(trainYrh)
+        trainYrl = np.squeeze(trainYrl)
+        trainYc  = np.squeeze(trainYc)
+        
+        testYrh = np.squeeze(testYrh)
+        testYrl = np.squeeze(testYrl)
+        testYc  = np.squeeze(testYc)
+        
+        return trainX, trainYrh, trainYrl, trainYc, testX, testYrh, testYrl, testYc
     
     
     
@@ -599,7 +716,6 @@ class MLmodels:
         
         return tree, endData, mets
         
-    
     
     
     
@@ -957,7 +1073,19 @@ if __name__ == "__main__":
                                           minDailyVolume = 5000000)
     
     
-    # mod.LSTM_train(EpochsPerTicker = 20, fullItterations = 10, loadPrevious = False, look_back = 250)
+    mod.LSTM_train(EpochsPerTicker = 1, 
+                   fullItterations = 1, 
+                   loadPrevious = False,
+                   look_back = 250, 
+                   trainSize = 0.9,
+                   predLen = 30, 
+                   storeTrainingDataInRAM = False)
+    
+    # data = mod.getLSTMTestTrainData(ticker = "AMZN",
+    #                                 look_back=250,
+    #                                 trainSize=0.9,
+    #                                 predLen = 30)
+    
     # data = mod.LSTM_load()
     # prediction, evaluation, testX, [testYr, testYc] = mod.LSTM_eval(ticker = "TSLA", evaluate = False)
     # lstm_pred = mod.LSTM_test()
@@ -965,10 +1093,6 @@ if __name__ == "__main__":
     # tree, endData, mets = mod.Trees("A", savePlt=True, evaluate = False)
     # lr_model = mod.linearRegression("A")
     # model_autoARIMA, fitted, endData = mod.autoARIMA("TSLA", evaluate=False, predLen=100, loadFromSave = False)
-    
-    
-    
-    
     
     
     

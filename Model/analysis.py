@@ -10,11 +10,9 @@ import numpy as np
 import sqlite3
 import commonUtilities
 import matplotlib.pyplot as plt
-
-#import statsmodels.api as sm
-
-
 import warnings
+import random
+
 warnings.filterwarnings("ignore")
 
 
@@ -24,9 +22,9 @@ class missingTicker(Exception):
 
 
 class analysis:
-    def __init__(self, dataBaseSaveFile = "./stockData.db"):
+    def __init__(self, dataBaseSaveFile = "./stockData.db", dataBaseThreadCheck = True):
+        self.DB = sqlite3.connect(dataBaseSaveFile, check_same_thread=dataBaseThreadCheck)
         self.mainDBName = dataBaseSaveFile
-        self.DB = sqlite3.connect(dataBaseSaveFile)
         self._cur = self.DB.cursor()
         self._tickerList = []   # Empty list that gets filled with a list of tickers to be considered
         self.tradingDateSet = []  # List of dates in YYYY-MM-DD format that are trading dates in the database
@@ -41,90 +39,7 @@ class analysis:
         # prevent database corruption.
         self._dailyConversionTable = commonUtilities.conversionTables.dailyConversionTable
         
-        self.indicatorList = {"ADJRATIO"     : "adjustment_ratio",
-                              "MA20"         : "mvng_avg_20", 
-                              "MA50"         : "mvng_avg_50", 
-                              "BOLLINGER20"  : "bollinger_20",
-                              "TP20"         : "tp20",
-                              "BOLLINGER50"  : "bollinger_50",
-                              "TP50"         : "tp50",
-                              "MACD12"       : "macd_12_26", 
-                              "MACD19"       : "macd_19_39",
-                              "VOL20"        : "vol_avg_20",
-                              "VOL50"        : "vol_avg_50",
-                              "OBV"          : "on_bal_vol", 
-                              "DAYCHANGE"    : "percent_cng_day", 
-                              "TOTALCHANGE"  : "percent_cng_tot", 
-                              "RSI"          : "rsi"}
-        
-    
-    
-    def dailyReturns(self,
-                     tickerList = [],
-                     plot = False):
-        
-        self.validate.validateListString(tickerList)
-        
-        tickerGroups = int(len(tickerList) / 100) + 1
-        results = pd.DataFrame()
-        
-        for i in range(tickerGroups):
-            minIndex = i * 100
-            maxIndex = minIndex + 100 if (minIndex + 100 < len(tickerList)) else len(tickerList) - 1
-            
-            tickerListSubset = tickerList[minIndex:maxIndex]
-            
-            # start a SQL query string and an list of arguments.  Leave a space for
-            # the specific columns that should be requested ("[REQUEST_WHAT]")
-            queryString = "SELECT * " +\
-                          "FROM summary_data \n" +\
-                          "WHERE 1=1  \n AND "
-            
-            argList = []
-            
-            # append to the SQL query string and argument list each ticker from the 
-            # function inputs
-            for ticker in tickerListSubset:
-                ticker = "".join(e.upper() for e in ticker if e.isalpha())
-                argList.append(ticker)
-                queryString += "ticker_symbol = ? \n  OR "
-            
-            # sort the tickers aphabetically, convert the argument list to a non-changeable tuple,
-            # and complete the SQL query string
-            argList.sort()
-            argList = tuple(argList)
-            queryString = queryString[:-7] + ";\n"
-        
-        
-            # execute the SQL query and convert the response to a pandas dataframe
-            query = self._cur.execute(queryString, argList)
-            cols = [column[0] for column in query.description]
-            results = results.append(pd.DataFrame.from_records(data = query.fetchall(), columns = cols))
-            
-        
-        if plot == True and len(tickerList) < 10:
-            for ticker in tickerListSubset:
-                queryString  = "SELECT * "
-                queryString += "FROM daily_adjusted \n"
-                queryString += "WHERE ticker_symbol = '" + ticker + "';\n"
-                
-                query = self._cur.execute(queryString)
-                cols = [column[0] for column in query.description]
-                plotResults = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
-                
-                # convert the recordDate from a string to a datetime object, and set as the index
-                plotResults["recordDate"] = pd.to_datetime(plotResults["recordDate"])
-                plotResults = plotResults.set_index("recordDate")
-                plotResults.sort_index()
-                
-                plt.figure()
-                plotResults["percent_cng_day"].hist(bins = 1000)
-                plt.figure()
-                plotResults["adj_close"].plot()
-        
-        
-        results = results.reset_index()
-        return results
+        self.indicatorList = commonUtilities.conversionTables.indicatorList
     
     
     
@@ -174,9 +89,9 @@ class analysis:
                 stats.at[table, "percent_delta_volume"] = [100*abs(a - b) / a for a, b in zip(df[0]["volume"], df[i]["volume"])]
         
         return stats
-        
-        
-        
+    
+    
+    
     def fillTradingDates(self):
         
         for table in self.dailyTableNames:
@@ -450,375 +365,212 @@ class analysis:
     
     
     
-    def coor_MACD(self, tickerList = [], tradeDelay = 0):
-        indics = ["MACD12", "MACD19"]
-        loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, indicators = indics)
+    def storeTriggers(self, OBVshift = 10, rsiLower = 30, rsiUpper = 70, multiplier = 2, indicators = [], tickerList = []):
         
-        loadedData["tradePrice"] = None
-        for ind in indics:
-            loadedData[self.indicatorList[ind] + "_trig"] = None
+        if indicators == []:
+            indicators = list(self.indicatorList.keys())
+        if tickerList == []:
+            tickerList = self._tickerList
+            
+        for ind in indicators:
+            assert ind in self.indicatorList.keys(), "\nError, 'indicators' passed to 'storeTriggers()' not in 'indicatorList' key list."
         
-        for ind in indics:
-            indColName = self.indicatorList[ind]
-            results = pd.DataFrame(columns = loadedData.columns)
+        tickNum = 0
+        
+        for tick in tickerList:
+            tickNum += 1
+            print("\rProcessing ticker:  " + str(tick).rjust(6) + ",     " + str(tickNum).rjust(6) + "  of  " + str(len(tickerList)) + ".                                       ", end = "")
             
-            x_p = []
-            x_n = []
-            y_p = []
-            y_n = []
+            queryString = "SELECT * " +\
+                          "FROM daily_adjusted \n" +\
+                          "WHERE ticker_symbol = ? "
             
-            for tick in tickerList:
-                print("\rProcessing ticker:  " + str(tick).rjust(6) + "  for  " + ind + ".                                       ", end = "")
-                rslt_df = loadedData.loc[loadedData["ticker_symbol"] == tick]
-                rslt_df[indColName + "_trig"] = np.append(np.diff(np.sign(rslt_df[indColName])), [0])
-                rslt_df["tradePrice"] = rslt_df["adj_close"].shift(periods = tradeDelay)
+            argList = [tick]
+            
+            # execute the SQL query and convert the response to a pandas dataframe
+            query = self._cur.execute(queryString, argList)
+            cols = [column[0] for column in query.description]
+            rslt_df = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+            
+            
+            # start SQL query line for saving the triggers back to the database
+            sqlString  = "UPDATE daily_adjusted \n SET "
+            sqlArray = pd.DataFrame()
+        
+            for indicator in indicators:
                 
-                results = pd.concat([results, rslt_df])
-            
-            
-            print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
-            triggerLoc = list(np.where(np.diff(np.sign(results[indColName])))[0])
-            
-            for i in range(len(triggerLoc)-1):
-                if results[indColName + "_trig"][triggerLoc[i]] > 0:
-                    y_p.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-                else:
-                    y_n.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-            
-            
-            x_p = pd.Series([x for seg in x_p for x in seg])
-            x_n = pd.Series([x for seg in x_n for x in seg])
-            
-            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
-            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
-            
-            plt.figure()
-            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
-            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
-            plt.title("Scatter Plot of time vs returns " + ind)
-            plt.legend()
-            
-            
-            avgNeg = y_n.mean()
-            avgPos = y_p.mean()
-            avgLen = len(results)/len(triggerLoc)
-            
-            print()
-            print()
-            print("average " + ind + " positive return:   " + str(avgPos))
-            print("average " + ind + " negative return:   " + str(avgNeg))
-            print("average " + ind + " timeframe:         " + str(avgLen))
-            print()
-            
-        return results, triggerLoc
-    
-    
-    
-    def coor_MA(self, tickerList = [], tradeDelay = 0):
-        indics = ["MA20", "MA50"]
-        loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, indicators = indics)
-        
-        loadedData["tradePrice"] = None
-        for ind in indics:
-            loadedData[self.indicatorList[ind] + "_trig"] = None
-        
-        for ind in indics:
-            indColName = self.indicatorList[ind]
-            results = pd.DataFrame(columns = loadedData.columns)
-            
-            x_p = []
-            x_n = []
-            y_p = []
-            y_n = []
-            
-            for tick in tickerList:
-                print("\rProcessing ticker:  " + str(tick).rjust(6) + "  for " + ind + ".                                       ", end = "")
-                rslt_df = loadedData.loc[loadedData["ticker_symbol"] == tick]
-                rslt_df[indColName + "_trig"] = np.append(np.diff(np.sign(rslt_df["adj_close"] - rslt_df[indColName])), [0])
-                rslt_df["tradePrice"] = rslt_df["adj_close"].shift(periods = tradeDelay)
+                ind = self.indicatorList[indicator]
                 
-                results = pd.concat([results, rslt_df])
-            
-            
-            print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
-            triggerLoc = list(np.where(np.diff(np.sign(results[indColName + "_trig"])))[0])
-            
-            for i in range(len(triggerLoc)-1):
-                if results[indColName + "_trig"][triggerLoc[i]] > 0:
-                    y_p.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-                else:
-                    y_n.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-            
-            
-            x_p = pd.Series([x for seg in x_p for x in seg])
-            x_n = pd.Series([x for seg in x_n for x in seg])
-            
-            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
-            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
-            
-            plt.figure()
-            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
-            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
-            plt.title("Scatter Plot of time vs returns " + ind)
-            plt.legend()
-            
-            
-            avgNeg = y_n.mean()
-            avgPos = y_p.mean()
-            avgLen = len(results)/len(triggerLoc)
-            
-            print("average " + ind + " positive return:   " + str(avgPos))
-            print("average " + ind + " negative return:   " + str(avgNeg))
-            print("average " + ind + " timeframe:         " + str(avgLen))
-            print()
-            
-        return results, triggerLoc
-    
-    
-    
-    def coor_BOLL(self, tickerList = [], tradeDelay = 0):
-        # need the TP for Bollinger Band Calcs
-        indics = {"BOLLINGER20": "TP20", 
-                  "BOLLINGER50": "TP50"}
-        loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, 
-                                                        indicators = list(indics.keys()) + list(indics.values()))
-        
-        loadedData["tradePrice"] = None
-        
-        for ind in indics.keys():
-            loadedData[self.indicatorList[ind] + "_trig"] = None
-        
-        for ind in indics.keys():
-            indColName  = self.indicatorList[ind]
-            helpColName = self.indicatorList[indics[ind]]
-            results = pd.DataFrame(columns = loadedData.columns)
-            
-            x_p = []
-            x_n = []
-            y_p = []
-            y_n = []
-            
-            for tick in tickerList:
-                print("\rProcessing ticker:  " + str(tick).rjust(6) + "  for " + ind + ".                                                            ", end = "")
-                rslt_df = loadedData.loc[loadedData["ticker_symbol"] == tick]
+                triggerColumn = ind + "_trig"
                 
-                upper = [tp + b for tp, b in zip(rslt_df[helpColName], rslt_df[indColName])]
-                lower = [tp - b for tp, b in zip(rslt_df[helpColName], rslt_df[indColName])]
-                trig  = [0] * len(upper)
-                delta = list(np.sign([t2 - t1 for t2, t1 in zip(rslt_df[helpColName][1:], rslt_df[helpColName][:-1])]))
-                delta.append(0)
-                lstlen=len(delta)
-                trend = np.sign([sum(delta[max(i-20, 0):i]) for i in range(lstlen)])
-                
-                trig = [-1 if c > u and tr < 0 else tg for c, u, tr, tg in zip(rslt_df["adj_close"], upper, trend, trig)]
-                trig = [ 1 if c < l and tr > 0 else tg for c, l, tr, tg in zip(rslt_df["adj_close"], lower, trend, trig)]
-                
-                rslt_df[indColName + "_trig"] = trig
-                rslt_df["tradePrice"] = rslt_df["adj_close"].shift(periods = tradeDelay)
-                
-                results = pd.concat([results, rslt_df])
-            
-            
-            print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
-            triggerLoc = [i for i, e in enumerate(results[indColName + "_trig"]) if e != 0]
-            # triggerLoc = []
-            
-            # return loc, results[indColName + "_trig"], upper
-            
-            # for i in range(1,len(loc)):
-            #     if results[indColName + "_trig"][loc[i]] != results[indColName + "_trig"][loc[i-1]]:
-            #         triggerLoc.append(loc[i])
+                if "macd" in ind:
+                    rslt_df[triggerColumn] = np.sign(rslt_df[ind])
+                if "mvng_avg" in ind:
+                    rslt_df[triggerColumn] = np.sign(rslt_df["adj_close"] - rslt_df[ind])
+                if "bal_vol" in ind:
+                    rslt_df[triggerColumn] = np.sign(rslt_df[ind] - rslt_df[ind].shift(periods = OBVshift, fill_value = 0))
+                if "rsi" in ind:
+                    temp = [1 if x>rsiUpper else -1 if x<rsiLower else 0 for x in rslt_df[ind]]
+                    temp = [1 if (x<rsiLower and y>rsiLower) 
+                            else -1 if (x>rsiUpper and y<rsiUpper)
+                            else  t for x,y,t 
+                            in zip(rslt_df[ind][:-1], rslt_df[ind][1:], temp)]
+                    temp.append(0)
+                    rslt_df[triggerColumn] = temp
+                    rslt_df[triggerColumn].replace(to_replace=0, method='ffill', inplace=True)
                     
+                if "bollinger" in ind:
+                    helperCol = "tp" + ind.split("_")[1]
+                    
+                    upper = [tp + (b * multiplier) for tp, b in zip(rslt_df[helperCol], rslt_df[ind])]
+                    lower = [tp - (b * multiplier) for tp, b in zip(rslt_df[helperCol], rslt_df[ind])]
+                    
+                    trig  = [np.nan] * len(upper)
+                    prevClose = list(rslt_df["adj_close"][:-1])
+                    prevClose.insert(0,0)
+                    adjClose = rslt_df["adj_close"]
+                    
+                    trig = [ 1 if pc < l  and c > l  else tg for pc, c, l, tg in zip(prevClose, adjClose, lower, trig)]
+                    trig = [-1 if pc > u  and c < u  else tg for pc, c, u, tg in zip(prevClose, adjClose, upper, trig)]
+                    trig = [ 0 if (pc > tp and c < tp) or (pc < tp and c > tp) else tg for pc, c, tp, tg in zip (prevClose, adjClose, rslt_df[helperCol], trig)]
+                    
+                    rslt_df[triggerColumn] = trig
+                    rslt_df[triggerColumn].replace(to_replace = np.nan, method = "ffill", inplace = True)
+                    
+                if "ideal" in ind:
+                    pass
+                    
+                    
+                # add each indicator trigger in the list of indicators to the 
+                # SQL query, along with the associated values.
+                sqlString += str(triggerColumn) + " = ?, \n     "
+                sqlArray[triggerColumn] = rslt_df[triggerColumn]
+                
+            # finish the string, execute the SQL transaction, and commit the changes
+            sqlString  = sqlString[:-8] + "\n"
+            sqlString += "WHERE ticker_symbol = ? AND recordDate = ?; \n"
+            sqlArray["ticker_symbol"] = tick
+            sqlArray["recordDate"] = rslt_df["recordDate"]
+            sqlArray = sqlArray.values.tolist()
             
-            for i in range(len(triggerLoc)-1):
-                if results[indColName + "_trig"][triggerLoc[i]] > 0:
-                    y_p.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-                else:
-                    y_n.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-            
-            
-            x_p = pd.Series([x for seg in x_p for x in seg])
-            x_n = pd.Series([x for seg in x_n for x in seg])
-            
-            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
-            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
-            
-            plt.figure()
-            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
-            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
-            plt.title("Scatter Plot of time vs returns " + ind)
-            plt.legend()
-            
-            
-            avgNeg = y_n.mean()
-            avgPos = y_p.mean()
-            avgLen = len(results)/len(triggerLoc)
-            
-            print("average " + ind + " positive return:   " + str(avgPos))
-            print("average " + ind + " negative return:   " + str(avgNeg))
-            print("average " + ind + " timeframe:         " + str(avgLen))
-            print()
-            
-        return results, triggerLoc
+            self._cur.executemany(sqlString, sqlArray)
+            self.DB.commit()
     
     
     
-    def coor_RSI(self, tickerList = [], tradeDelay = 0, upperThreshold = 70, lowerThreshold = 30):
-        indics = ["RSI"]
-        loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, indicators = indics)
+    def plotIndicators(self, tickerList = [], indicators = [], tradeDelay = 1):
+        print("\nProcessing plotting...")
+        if indicators == []:
+            indicators = list(self.indicatorList.keys())
+        if tickerList == []:
+            tickerList = self._tickerList
         
-        loadedData["tradePrice"] = None
-        for ind in indics:
-            loadedData[self.indicatorList[ind] + "_trig"] = None
+        loadedData, trigList = self.loadFromDB(tickerList = tickerList, indicators = indicators, withTriggers = True)
         
-        for ind in indics:
+        print()
+        
+        
+        for ind in indicators:
+            print("Indicator:  " + ind + "                                                             ")
             indColName = self.indicatorList[ind]
-            results = pd.DataFrame(columns = loadedData.columns)
+            
             
             x_p = []
             x_n = []
             y_p = []
             y_n = []
+            gain = []
+            loss = []
+            return_p = []
+            return_n = []
+            triggerCount = 0
             
-            for tick in tickerList:
-                print("\rProcessing ticker:  " + str(tick).rjust(6) + "  for " + ind + ".                                       ", end = "")
+            
+            for ticker in tickerList:
+                print("\rParsing ticker:   " + ticker + "                                                                             ", end = "")
                 
-                rslt_df = loadedData.loc[loadedData["ticker_symbol"] == tick]
+                tickerData = loadedData.loc[loadedData["ticker_symbol"] == ticker]
                 
-                temp = [1 if (x<lowerThreshold and y>lowerThreshold) else -1 if (x>upperThreshold and y<upperThreshold)
-                        else 0 for x,y in zip(rslt_df[indColName][:-1],rslt_df[indColName][1:])]
+                triggerLoc = np.where(np.diff(tickerData[indColName + "_trig"]))[0]
                 
-                temp.insert(0,0)
-                rslt_df[indColName + "_trig"] = temp
-                rslt_df["tradePrice"] = rslt_df["adj_close"].shift(periods = tradeDelay)
+                adjRat = [a / c for a, c in zip(tickerData["adj_close"], tickerData["close"])]
                 
-                results = pd.concat([results, rslt_df])
+                tradePrice = [a * o for a, o in zip(adjRat, tickerData["open"])]
+                tradePrice = tradePrice[tradeDelay:]
+                tradePrice.append([tradePrice[-1] * tradeDelay])
+                
+                locRangeStart = min(tickerData.index)
+                for i in range(len(triggerLoc)-1):
+                    triggerCount += 1 
+                    
+                    if tickerData[indColName + "_trig"][triggerLoc[i] + 1 + locRangeStart] > 0.25:    # triggerLoc[i] + 1 in index due to function of np.diff in calculating the triggers
+                        y_p.append([p1 / tradePrice[triggerLoc[i]] for p1 in tradePrice[triggerLoc[i]:triggerLoc[i+1]]])
+                        x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] )))
+                        gain.append((1 / tradePrice[triggerLoc[i]], triggerLoc[i+1] - triggerLoc[i] ))
+                        
+                        
+                    elif tickerData[indColName + "_trig"][triggerLoc[i] + 1 + locRangeStart] < 0.25:    # triggerLoc[i] + 1 in index due to function of np.diff in calculating the triggers
+                        y_n.append([p1 / tradePrice[triggerLoc[i]] for p1 in tradePrice[triggerLoc[i]:triggerLoc[i+1]]])
+                        x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] )))
+                        loss.append((1 / tradePrice[triggerLoc[i]], triggerLoc[i+1] - triggerLoc[i] ))
+                        
+                        
+                for i in range(len(gain)):
+                    return_p.append(365 * ((y_p[i][-1] ** (1/(365*gain[i][1]/253)))  -1))
+                
+                for i in range(len(loss)):
+                    return_n.append(365 * ((y_n[i][-1] ** (1/(365*loss[i][1]/253)))  -1))
+                
             
-            print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
-            triggerLoc = list(np.where(list(results[indColName + "_trig"]))[0])
+            x_p = pd.Series([x+random.randrange(00, 49)/100 for seg in x_p for x in seg])  # Place gains into the first half of a given day; helps with visulaization
+            x_n = pd.Series([x+random.randrange(50, 99)/100 for seg in x_n for x in seg])  # Place losses into the second half of a given day; helps with visulaization
             
-            for i in range(len(triggerLoc)-1):
-                if results[indColName + "_trig"][triggerLoc[i]] > 0:
-                    y_p.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-                else:
-                    y_n.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
+            y_p = pd.Series([100*(y-1) for seg in y_p for y in seg])  # Convert to percent changes
+            y_n = pd.Series([100*(y-1) for seg in y_n for y in seg])
             
-            
-            x_p = pd.Series([x for seg in x_p for x in seg])
-            x_n = pd.Series([x for seg in x_n for x in seg])
-            
-            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
-            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
-            
-            plt.figure()
-            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
-            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
+            plt.figure(dpi = 1000)
+            plt.scatter(x_p, y_p, marker = ".", s = min( 5000/len(tickerList), 3), c = "#00cc00", label = "buy",  linewidths = 0, alpha = 1.000)
+            plt.scatter(x_n, y_n, marker = ".", s = min( 5000/len(tickerList), 3), c = "#ff0000", label = "sell", linewidths = 0, alpha = 0.500)
             plt.title("Scatter Plot of time vs returns " + ind)
-            plt.legend()
+            plt.legend(markerscale = 10)
             
             
-            avgNeg = y_n.mean()
-            avgPos = y_p.mean()
-            avgLen = len(results)/len(triggerLoc)
+            avgPos = sum(return_p) / len(return_p)
+            avgNeg = sum(return_n) / len(return_n)
+            avgLen = len(loadedData)/triggerCount
             
-            print("average " + ind + " positive return:   " + str(avgPos))
-            print("average " + ind + " negative return:   " + str(avgNeg))
-            print("average " + ind + " timeframe:         " + str(avgLen))
-            print()
+            print("\r                                                                                 ")
+            print("average " + ind + " positive return:   " + str(avgPos*100)[:5] + "% per year.")
+            print("average " + ind + " negative return:   " + str(avgNeg*100)[:5] + "% per year.")
+            print("average " + ind + " timeframe:         " + str(avgLen)[:5]     + " days between trades.")
+            print("\n")
             
-        return results, triggerLoc
+        return loadedData
     
     
     
-    def coor_OBV(self, tickerList = [], OBVshift = 1, tradeDelay = 0):
-        indics = ["OBV"]
-        loadedData, trigList = self.loadIndicatorFromDB(tickerList = tickerList, indicators = indics)
-        
-        loadedData["tradePrice"] = None
-        for ind in indics:
-            loadedData[self.indicatorList[ind] + "_trig"] = None
-            loadedData[self.indicatorList[ind] + "_comp"] = None
-        
-        for ind in indics:
-            indColName = self.indicatorList[ind]
-            results = pd.DataFrame(columns = loadedData.columns)
-            
-            x_p = []
-            x_n = []
-            y_p = []
-            y_n = []
-            
-            for tick in tickerList:
-                print("\rProcessing ticker:  " + str(tick).rjust(6) + "  for " + ind + ".                                       s", end = "")
-                rslt_df = loadedData.loc[loadedData["ticker_symbol"] == tick]
-                rslt_df[indColName + "_comp"] = rslt_df[indColName].shift(periods = OBVshift, fill_value = 0)
-                rslt_df[indColName + "_trig"] = np.append(np.diff(np.sign(rslt_df[indColName] - rslt_df[indColName + "_comp"])), [0])
-                rslt_df["tradePrice"] = rslt_df["adj_close"].shift(periods = tradeDelay)
-                
-                results = pd.concat([results, rslt_df])
-                
-            
-            print("\rPlotting  for  " + ind + ".                                                                      ", end = "")
-            triggerLoc = list(np.where(np.diff(np.sign(rslt_df[indColName] - rslt_df[indColName + "_comp"])))[0])
-            
-            for i in range(len(triggerLoc)-1):
-                if results[indColName + "_trig"][triggerLoc[i]] > 0:
-                    y_p.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_p.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-                else:
-                    y_n.append(list(results["tradePrice"][triggerLoc[i]+1:triggerLoc[i+1]]/results["tradePrice"][triggerLoc[i]]))
-                    x_n.append(list(range(triggerLoc[i+1] - triggerLoc[i] - 1)))
-            
-            
-            x_p = pd.Series([x for seg in x_p for x in seg])
-            x_n = pd.Series([x for seg in x_n for x in seg])
-            
-            y_p = pd.Series([y/seg[0]-1 for seg in y_p for y in seg])
-            y_n = pd.Series([y/seg[0]-1 for seg in y_n for y in seg])
-            
-            plt.figure()
-            plt.scatter(x_p, y_p, marker = ".", s = 5, c = "#00cc00", label = "buy")
-            plt.scatter(x_n, y_n, marker = ".", s = 5, c = "#ff0000", label = "sell")
-            plt.title("Scatter Plot of time vs returns " + ind)
-            plt.legend()
-            
-            
-            avgNeg = y_n.mean()
-            avgPos = y_p.mean()
-            avgLen = len(results)/len(triggerLoc)
-            
-            print("average " + ind + " positive return:   " + str(avgPos))
-            print("average " + ind + " negative return:   " + str(avgNeg))
-            print("average " + ind + " timeframe:         " + str(avgLen))
-            print()
-            
-        return results, triggerLoc
-    
-    
-    
-    def loadIndicatorFromDB(self, tickerList = [], indicators = []):
+    def loadFromDB(self, tickerList = [], indicators = [], extras = [], withTriggers = False):
         self.validate.validateListString(tickerList)
         self.validate.validateListString(indicators)
         for value in indicators:
             if value not in self.indicatorList.keys():
                 raise ValueError("Indicators passed are not listed in analysis module.")
         
+        
+        for value in extras:
+            if value not in self._dailyConversionTable.keys():
+                raise ValueError("Extras passed are not valid.")
+        
         results = pd.DataFrame()
         trigList = []
         
+        print()
+        
         for tick in tickerList:
-            print("\rRetrieving ticker:  " + str(tick).rjust(6) + "  and indicators:  " + str(indicators) + ".             ", end = "")
+            # print("\rRetrieving ticker:  '" + str(tick).ljust(6) + "'  with indicators:  " + str(indicators) + ".             ", end = "")
             argList = []
             argList.append(tick)
-            queryString = "SELECT [INDICATORS] adj_close, ticker_symbol " +\
+            queryString = "SELECT [INDICATORS] adj_close, close, open, ticker_symbol, recordDate " +\
                           "FROM daily_adjusted \n" +\
                           "WHERE ticker_symbol = ?;"
             
@@ -827,6 +579,12 @@ class analysis:
             indicatorString = ""
             for ind in indicators:
                 indicatorString += self.indicatorList[ind] + ", "
+                if withTriggers:
+                    indicatorString += self.indicatorList[ind] + "_trig, "
+            
+            for ext in extras:
+                indicatorString += self._dailyConversionTable[ext] + ", "
+                
             
             queryString = queryString.replace("[INDICATORS]", indicatorString)
             
@@ -838,6 +596,7 @@ class analysis:
         
         trigList.pop()
         
+        print()
         return results, trigList
     
     
@@ -853,16 +612,26 @@ class analysis:
         # https://www.sqlitetutorial.net/sqlite-describe-table/
         schemaText = self._cur.execute("""SELECT sql 
                                           FROM sqlite_schema 
-                                          WHERE name = 'daily_adjusted';""").fetchall()
-        schemaText = schemaText[0][0] # convert the returned tuple to an executable SQL string command
-        schemaText = schemaText[schemaText.find('('):]
+                                          WHERE name = 'daily_adjusted'
+                                             OR name = 'summary_data'
+                                             OR name = 'ticker_symbol_list';""").fetchall()
+        
+        # convert the returned tuple to an executable SQL string command
+        summaryText = schemaText[0][0][schemaText[0][0].find('('):]
+        symbolText  = schemaText[1][0][schemaText[1][0].find('('):]
+        dailyText   = schemaText[2][0][schemaText[2][0].find('('):]
         
         
         # create a new database and add a copy of the time series table schema
         self._cur.execute("ATTACH DATABASE ? AS newDB;", [newDBName])
         if delCurrentTable:
             self._cur.execute("DROP TABLE IF EXISTS newDB.daily_adjusted;")
-        self._cur.execute("CREATE TABLE newDB.daily_adjusted" + schemaText + ";")
+            self._cur.execute("DROP TABLE IF EXISTS newDB.summary_data;")
+            self._cur.execute("DROP TABLE IF EXISTS newDB.ticker_symbol_list;")
+            
+        self._cur.execute("CREATE TABLE newDB.daily_adjusted" + dailyText + ";")
+        self._cur.execute("CREATE TABLE newDB.summary_data" + summaryText + ";")
+        self._cur.execute("CREATE TABLE newDB.ticker_symbol_list" + symbolText + ";")
         
         n = 0
         for ticker in self._tickerList:
@@ -871,123 +640,108 @@ class analysis:
             self._cur.execute("""INSERT INTO newDB.daily_adjusted 
                                  SELECT * FROM main.daily_adjusted
                                  WHERE ticker_symbol = ?;""", [ticker])
+                                 
+            self._cur.execute("""INSERT INTO newDB.summary_data 
+                                 SELECT * FROM main.summary_data
+                                 WHERE ticker_symbol = ?;""", [ticker])
+                                 
+            self._cur.execute("""INSERT INTO newDB.ticker_symbol_list 
+                                 SELECT * FROM main.ticker_symbol_list
+                                 WHERE ticker_symbol = ?;""", [ticker])
         
         self.DB.commit()
         self._cur.execute("DETACH DATABASE newDB;")
         print("\nComplete.")
         return
+    
+    
+    
+    def copyTimeSeriesToCSV(self, newDBName):
+        if self._tickerList == []:
+            raise ValueError("Selected Ticker List is empty.  Run 'filterStocksFromDataBase()' to add tickers to the list.")
+        if newDBName == "" or not isinstance(newDBName, str) or newDBName == self.mainDBName:
+            raise ValueError("Database Name is not valid.")
         
+        
+        loadedData, trigList = self.loadFromDB(tickerList = self._tickerList, indicators = list(self.indicatorList.keys()), withTriggers = True)
+        loadedData.sort_values(by = ["ticker_symbol", "recordDate"], ascending=True, inplace=True)
+        
+        
+        loadedData.to_csv(path_or_buf = newDBName)
+        
+        print("\nComplete.")
+        return
+    
+    
+    
+    
+    def searchForStock(self, searchString, name = False):
+        queryString = "SELECT ticker_symbol, name FROM ticker_symbol_list;"
+        
+        query = self._cur.execute(queryString)
+        cols = [column[0] for column in query.description]
+        df = pd.DataFrame.from_records(data = query.fetchall(), columns = cols)
+        
+        df["name_upper"] = df["name"].str.upper()
+        df["ticker_symbol"] = df["ticker_symbol"].str.upper()
+        searchString = searchString.upper()
+        
+        if name:
+            df["instances"] = df["name_upper"].str.find(searchString)
+            df = df[df.instances != -1]
+            df.reset_index(inplace = True)
+            df.index += 1 
+            df.rename(columns={"name": "Company Name", "ticker_symbol": "Ticker Symbol"}, inplace = True)
+            
+            outputString = df[["Ticker Symbol", "Company Name"]].to_html(classes = "tickertable\" id=\"companyList")
+            
+        
+        else:
+            df["instances"] = df["ticker_symbol"].str.find(searchString)
+            df = df[df.instances != -1]
+            df.reset_index(inplace = True)
+            df.index += 1 
+            df.rename(columns={"name": "Company Name", "ticker_symbol": "Ticker Symbol"}, inplace = True)
+            
+            outputString = df[["Ticker Symbol", "Company Name"]].to_html(classes = "tickertable\" id=\"companyList")
+            
+        
+        outputString  = outputString.replace("dataframe ", "")
+        outputString  = outputString.replace("style=\"text-align: right;\"", "")
+                              
+        outputString  = outputString.replace("<tr>", "<tr onclick=\"rowSelect(this)\">")
+        outputString += """\n<br><br>\n<script>
+                            function rowSelect(x) {
+                              document.getElementById("symbol").value=x.cells[1].innerHTML
+                              document.getElementById("predictForm").submit()
+                            }
+                            </script><br><br>"""
+        return outputString
+    
+            
 
 
 
 
 if __name__ == "__main__":
-    # decomposition = sm.tsa.seasonal_decompose()
-    
-    # rcParams["figure.figsize"] = 16, 4
-    # decomposition.seasonal.plot();
-    
     ana = analysis()
-    ana.filterStocksFromDataBase(dailyLength = 1250, maxDailyChange = 100, minDailyChange = -80, minDailyVolume = 500000)
+    data = ana.filterStocksFromDataBase(dailyLength = 1250, 
+                                          maxDailyChange = 50, 
+                                          minDailyChange = -50, 
+                                          minDailyVolume = 500000)
+    
     print("Number of stocks selected:  " + str(len(ana._tickerList)) + ".             ")
     
-    
-    #ana.coor_MACD(tickerList = ana._tickerList)
-    ana.coor_BOLL(tickerList = ana._tickerList)
-    #ana.coor_MA(tickerList   = ana._tickerList)
-    #ana.coor_OBV(tickerList  = ana._tickerList)
-    #ana.coor_RSI(tickerList  = ana._tickerList)
-    
-    
-    #ana.copyTimeSeriesToNewDatabase(newDBName = "./DBcopy.db")
-    
-    
-    # vol_diff = [[],[],[]]
-    # close_diff = [[],[],[]]
-    
-    # results = ana.dailyReturns(tickerList=ana._tickerList)
-    
-    # plt.close('all')
-    
-    # for ticker in ana._tickerList:
-    #     print("\rCalculating volume and price differential stats for:  " + str(ticker).rjust(6) + ".                ", end = "")
-    #     try:
-    #         stats = ana.compareDataSources(ticker = ticker)
-    #         deltaVol = stats["percent_delta_volume"]["yahoo"]
-    #         deltaClose = stats["percent_delta_close"]["yahoo"]
-            
-    #         vol_diff[0].append(max(deltaVol))
-    #         vol_diff[1].append(min(deltaVol))
-    #         vol_diff[2].append(sum(deltaVol) / len(deltaVol))
-            
-    #         close_diff[0].append(max(deltaClose))
-    #         close_diff[1].append(min(deltaClose))
-    #         close_diff[2].append(sum(deltaClose) / len(deltaClose))
-            
-    #     except missingTicker as mT:
-    #         print("\r" + str(mT) + "                                                                     ")
-            
-    #         vol_diff[0].append("None")
-    #         vol_diff[1].append("None")
-    #         vol_diff[2].append("None")
-            
-    #         close_diff[0].append("None")
-    #         close_diff[1].append("None")
-    #         close_diff[2].append("None")
-            
-    
-    # volAndPriceDiff = np.array(vol_diff + close_diff).T
-    # volAndPriceDiff = pd.DataFrame(volAndPriceDiff, columns = ["maxVol", "minVol", "avgVol", "maxPrice", "minPrice", "avgPrice"])    
-    # volAndPriceDiff.replace('None', np.nan, inplace=True)
-    # cols = volAndPriceDiff.columns
-    # volAndPriceDiff[cols] = volAndPriceDiff[cols].apply(pd.to_numeric, errors='coerce')
-    # volAndPriceDiff.dropna(axis=0, inplace=True)
-    
-    
-    # print("\rVolume and Price differential calculations Complete.                       ")
-    # print("Plotting Figures...                                                ")
+    # new = ana.storeTriggers(tickerList = ana._tickerList)
+    # data = ana.plotIndicators(tickerList = ana._tickerList)
+    # ana.copyTimeSeriesToCSV("copyOfDB.csv")
+    schemaText = ana.copyTimeSeriesToNewDatabase("stockDB_partial.db")
     
     
     
-    # plt.figure()
-    # results["max_daily_change"].hist(bins=100)
-    # plt.title("Maximum Daily Change")
     
     
-    # plt.figure()
-    # results["min_daily_change"].hist(bins=100)
-    # plt.title("Minimum Daily Change")
-
     
-    # plt.figure()
-    # results["avg_return"].hist(bins=100)
-    # plt.title("Average Daily Change")
-    
-    
-    # plt.figure()
-    # results["std_return"].hist(bins=100)
-    # plt.title("StdDev of Daily Change")
-    
-    
-    # plt.figure()
-    # plt.hist(np.log(volAndPriceDiff["maxVol"]/100), bins = 50, label = "Max Vol Diff", histtype='step', stacked=True, fill=False)
-    # plt.hist(np.log(volAndPriceDiff["maxPrice"]/100), bins = 50, label = "Max Price Diff", histtype='step', stacked=True, fill=False)
-    # plt.title("log(Max)")
-    # plt.legend(prop={'size': 10})
-    
-    
-    # plt.figure()
-    # plt.hist(np.log(volAndPriceDiff["minVol"].replace(to_replace=0, value=0.000000001)/100), bins = 50, label = "Min Vol Diff", histtype='step', stacked=True, fill=False)
-    # plt.hist(np.log(volAndPriceDiff["minPrice"].replace(to_replace=0, value=0.000000001)/100), bins = 50, label = "Min Price Diff", histtype='step', stacked=True, fill=False)
-    # plt.title("log(Min)")
-    # plt.legend(prop={'size': 10})
-    
-    
-    # plt.figure()
-    # plt.hist(np.log(volAndPriceDiff["avgVol"]/100), bins = 50, label = "Avg Vol Diff", histtype='step', stacked=True, fill=False)
-    # plt.hist(np.log(volAndPriceDiff["avgPrice"]/100), bins = 50, label = "Avg Price Diff", histtype='step', stacked=True, fill=False)
-    # plt.title("log(Avg)")
-    # plt.legend(prop={'size': 10})
     
     
     
