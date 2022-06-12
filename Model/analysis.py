@@ -24,6 +24,8 @@ class missingTicker(Exception):
 
 class analysis:
     def __init__(self, dataBaseSaveFile = "./stockData.db", dataBaseThreadCheck = True):
+        self.dataBaseSaveFile = dataBaseSaveFile
+        self.dataBaseThreadCheck = dataBaseThreadCheck
         self.DB = sqlite3.connect(dataBaseSaveFile, check_same_thread=dataBaseThreadCheck)
         self.mainDBName = dataBaseSaveFile
         self._cur = self.DB.cursor()
@@ -565,8 +567,6 @@ class analysis:
         results = pd.DataFrame()
         trigList = []
         
-        print()
-        
         for tick in tickerList:
             # print("\rRetrieving ticker:  '" + str(tick).ljust(6) + "'  with indicators:  " + str(indicators) + ".             ", end = "")
             argList = []
@@ -597,7 +597,6 @@ class analysis:
         
         trigList.pop()
         
-        print()
         return results, trigList
     
     
